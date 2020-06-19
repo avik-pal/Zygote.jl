@@ -1,16 +1,27 @@
 using Zygote, Test
 using Zygote: gradient
+using CUDA: has_cuda
 
-if Zygote.usetyped
-  @info "Testing Zygote in type-hacks mode."
-else
-  @info "Testing Zygote in normal mode."
+@testset "Interface" begin  
+  include("interface.jl")
 end
 
-@testset "Zygote" begin
+
+@testset "Tools" begin  
+  include("tools.jl")
+end
+
 
 @testset "Features" begin
   include("features.jl")
+end
+
+@testset "Data Structures" begin
+  include("structures.jl")
+end
+
+@testset "ChainRules" begin
+  include("chainrules.jl")
 end
 
 @testset "Gradients" begin
@@ -25,4 +36,10 @@ end
   include("compiler.jl")
 end
 
+if has_cuda()
+  @testset "CUDA tests" begin
+    include("cuda.jl")
+  end
+else
+  @warn "CUDA not found - Skipping CUDA Tests"
 end

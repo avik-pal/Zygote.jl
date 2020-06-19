@@ -1,28 +1,38 @@
 # Custom Adjoints
 
+!!! note "Prefer to use ChainRules to define custom adjoints"
+    Zygote supports the use of [ChainRulesCore](http://www.juliadiff.org/ChainRulesCore.jl/stable/) to define custom sensitivities.
+    It is prefered to define the custom sensitivities using `ChainRulesCore.rrule` as they will work for many AD systems, not just Zygote.
+    These sensitivities can be added in your own package, or for Base functions they can be added to ChainRules.jl.
+
+    This documentation exists to descibe how Zygote works, and how adjoints can be directly defined for Zygote.
+    Defining adjoints this way does not make them accessible to other AD systems, but does let you do things that directly depend on how Zygote works.
+    It allows for specific definitions of adjoints that are only defined for Zgyote (which might work differently to more generic definitions defined for all AD).
+
+
 The `@adjoint` macro is an important part of Zygote's interface; customising your backwards pass is not only possible but widely used and encouraged. While there are specific utilities available for common things like gradient clipping, understanding adjoints will give you the most flexibility. We first give a bit more background on what these pullback things are.
 
 ## Pullbacks
 
-`gradient` is really just syntactic sugar around the more fundamental function `forward`.
+`gradient` is really just syntactic sugar around the more fundamental function `pullback`.
 
 ```julia
-julia> y, back = Zygote.forward(sin, 0.5);
+julia> y, back = Zygote.pullback(sin, 0.5);
 
 julia> y
 0.479425538604203
 ```
 
-`forward` gives two outputs: the result of the original function, `sin(0.5)`, and a *pullback*, here called `back`. `back` implements the gradient computation for `sin`, accepting a derivative and producing a new one. In mathematical terms, it implements a vector-Jacobian product. Where ``y = f(x)`` and the gradient ``\frac{\partial l}{\partial x}`` is written ``\bar{x}``, the pullback ``\mathcal{B}_y`` computes:
+`pullback` gives two outputs: the result of the original function, `sin(0.5)`, and a *pullback*, here called `back`. `back` implements the gradient computation for `sin`, accepting a derivative and producing a new one. In mathematical terms, it implements a vector-Jacobian product. Where ``y = f(x)`` and the gradient ``\frac{\partial l}{\partial x}`` is written ``\bar{x}``, the pullback ``\mathcal{B}_y`` computes:
 
 ```math
 \bar{x} = \frac{\partial l}{\partial x} = \frac{\partial l}{\partial y} \frac{\partial y}{\partial x} = \mathcal{B}_y(\bar{y})
 ```
 
-To make this concrete, take the function ``y = \sin(x)``. ``\frac{\partial y}{\partial x} = \cos(x)``, so the pullback is ``\bar{y} \cos(x)``. In other words `forward(sin, x)` behaves the same as
+To make this concrete, take the function ``y = \sin(x)``. ``\frac{\partial y}{\partial x} = \cos(x)``, so the pullback is ``\bar{y} \cos(x)``. In other words `pullback(sin, x)` behaves the same as
 
 ```julia
-dsin(x) = sin(x), ȳ -> (ȳ * cos(x),)
+dsin(x) = (sin(x), ȳ -> (ȳ * cos(x),))
 ```
 
 `gradient` takes a function ``l = f(x)`` and assumes ``l̄ = \frac{\partial l}{\partial l} = 1`` and feeds this in to the pullback. In the case of `sin`,
@@ -45,7 +55,7 @@ More generally
 
 ```julia
 julia> function mygradient(f, x...)
-         _, back = Zygote.forward(f, x...)
+         _, back = Zygote.pullback(f, x...)
          back(1)
        end
 mygradient (generic function with 1 method)
@@ -75,7 +85,7 @@ julia> gradient(mul, 2, 3)
 (3, 2)
 ```
 
-It might look strange that we write `mul(a, b)` twice here. In this case we want to call the normal `mul` function for the forward pass, but you may also want to modify the forward pass (for example, to capture intermediate results in the pullback).
+It might look strange that we write `mul(a, b)` twice here. In this case we want to call the normal `mul` function for the pullback pass, but you may also want to modify the pullback pass (for example, to capture intermediate results in the pullback).
 
 ## Custom Types
 
@@ -99,7 +109,7 @@ dist(p::Point) = sqrt(width(p)^2 + height(p)^2)
 
 ```julia
 julia> gradient(a -> dist(a), Point(1, 2))[1]
-(x = 0.5547001962252291, y = 0.8320502943378437)
+(x = 0.4472135954999579, y = 0.8944271909999159)
 ```
 
 Fundamentally, this happens because of Zygote's default adjoint for `getfield`.
@@ -166,19 +176,19 @@ Zygote provides both `hook` and `@showgrad` so you don't have to write these you
 
 ### Checkpointing
 
-A more advanced example is checkpointing, in which we save memory by re-computing the forward pass of a function during the backwards pass. To wit:
+A more advanced example is checkpointing, in which we save memory by re-computing the pullback pass of a function during the backwards pass. To wit:
 
 ```julia
 julia> checkpoint(f, x) = f(x)
 checkpoint (generic function with 1 method)
 
-julia> @adjoint checkpoint(f, x) = f(x), ȳ -> Zygote._forward(f, x)[2](ȳ)
+julia> @adjoint checkpoint(f, x) = f(x), ȳ -> Zygote._pullback(f, x)[2](ȳ)
 
 julia> gradient(x -> checkpoint(sin, x), 1)
 (0.5403023058681398,)
 ```
 
-If a function has side effects we'll see that the forward pass happens twice, as expected.
+If a function has side effects we'll see that the pullback pass happens twice, as expected.
 
 ```julia
 julia> foo(x) = (println(x); sin(x))

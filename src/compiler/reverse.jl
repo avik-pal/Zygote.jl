@@ -1,8 +1,7 @@
-using IRTools: IR, Variable, Argument, Pipe, xcall, arg, var, prewalk, postwalk,
-  blocks, predecessors, successors, argument!, arguments, branches, argmap,
-  exprtype, insertafter!, finish, allspats!, trimspats!, substitute!, substitute,
-  block, block!, branch!, return!, stmt
-using Base: @get!
+using IRTools: IR, Variable, Pipe, xcall, var, prewalk, postwalk,
+  blocks, predecessors, successors, argument!, arguments, branches,
+  insertafter!, finish, expand!, prune!, substitute!, substitute,
+  block, block!, branch!, return!, stmt, meta
 
 @inline tuple_va(N, xs) = xs
 @inline tuple_va(N, x, xs...) = (x, tuple_va(N, xs...)...)
@@ -15,7 +14,7 @@ gradindex(::Nothing, i) = nothing
 xgetindex(x, i...) = xcall(Base, :getindex, x, i...)
 xgradindex(x, i) = xcall(Zygote, :gradindex, x, i)
 
-normalise!(ir) = ir |> IRTools.merge_entry! |> IRTools.merge_returns!
+normalise!(ir) = ir |> IRTools.merge_returns!
 
 function instrument_new!(ir, v, ex)
   isexpr(ex, :new) ? (ir[v] = xcall(Zygote, :__new__, ex.args...)) :
@@ -24,14 +23,42 @@ function instrument_new!(ir, v, ex)
 end
 
 # Hack to work around fragile constant prop through overloaded functions
+unwrapquote(x) = x
+unwrapquote(x::QuoteNode) = x.value
+
 is_literal_getproperty(ex) =
-  (iscall(ex, Base, :getproperty) || iscall(ex, Core, :getfield)) &&
-  ex.args[3] isa QuoteNode
+  (iscall(ex, Base, :getproperty) || iscall(ex, Core, :getfield) || iscall(ex, Base, :getfield)) &&
+  ex.args[3] isa Union{QuoteNode,Integer}
 
 function instrument_getproperty!(ir, v, ex)
   is_literal_getproperty(ex) ?
-    (ir[v] = xcall(Zygote, :literal_getproperty, ex.args[2], Val(ex.args[3].value))) :
+    (ir[v] = xcall(Zygote, :literal_getproperty, ex.args[2], Val(unwrapquote(ex.args[3])))) :
     ex
+end
+
+is_literal_getindex(ex) =
+  iscall(ex, Base, :getindex) && length(ex.args) == 3 && ex.args[3] isa Union{Integer,QuoteNode}
+
+function instrument_getindex!(ir, v, ex)
+  is_literal_getindex(ex) ?
+    (ir[v] = xcall(Zygote, :literal_getindex, ex.args[2], Val(unwrapquote(ex.args[3])))) :
+    ex
+end
+
+is_literal_iterate(ex) =
+  iscall(ex, Base, :indexed_iterate) && length(ex.args) >= 3 && ex.args[3] isa Union{Integer,QuoteNode}
+
+function instrument_iterate!(ir, v, ex)
+  is_literal_iterate(ex) ?
+    (ir[v] = xcall(Zygote, :literal_indexed_iterate, ex.args[2],
+                   Val(unwrapquote(ex.args[3])), ex.args[4:end]...)) :
+    ex
+end
+
+function instrument_literals!(ir, v, ex)
+  ex = instrument_getproperty!(ir, v, ex)
+  ex = instrument_getindex!(ir, v, ex)
+  ex = instrument_iterate!(ir, v, ex)
 end
 
 function istrackable(x)
@@ -47,7 +74,7 @@ function instrument_global!(ir, v, ex)
   else
     ir[v] = prewalk(ex) do x
       istrackable(x) || return x
-      insert!(ir, v, stmt(xcall(Zygote, :unwrap, QuoteNode(x), x), type = exprtype(x)))
+      insert!(ir, v, xcall(Zygote, :unwrap, QuoteNode(x), x))
     end
   end
 end
@@ -56,13 +83,26 @@ function instrument(ir::IR)
   pr = Pipe(ir)
   for (v, st) in pr
     ex = st.expr
-    isexpr(ex, :foreigncall) && continue
-    isexpr(ex, :enter, :leave) && error("try/catch is not supported.")
-    ex = instrument_new!(pr, v, ex)
-    ex = instrument_getproperty!(pr, v, ex)
-    ex = instrument_global!(pr, v, ex)
+    if isexpr(ex, :foreigncall, :isdefined)
+      continue
+    elseif isexpr(ex, :enter, :leave)
+      error("try/catch is not supported.")
+    elseif isexpr(ex, :(=))
+      @assert ex.args[1] isa GlobalRef
+      pr[v] = xcall(Zygote, :global_set, QuoteNode(ex.args[1]), ex.args[2])
+    else
+      ex = instrument_new!(pr, v, ex)
+      ex = instrument_literals!(pr, v, ex)
+      ex = instrument_global!(pr, v, ex)
+    end
   end
-  return finish(pr)
+  ir = finish(pr)
+  # GlobalRefs can turn up in branch arguments
+  for b in blocks(ir), br in branches(b), i in 1:length(arguments(br))
+    (ref = arguments(br)[i]) isa GlobalRef || continue
+    arguments(br)[i] = push!(b, xcall(Zygote, :unwrap, QuoteNode(ref), ref))
+  end
+  return ir
 end
 
 const BranchNumber = UInt8
@@ -92,51 +132,28 @@ ignored_f(f) = f in (GlobalRef(Base, :not_int),
                      GlobalRef(Core, :kwfunc),
                      GlobalRef(Core, :isdefined))
 ignored_f(ir, f) = ignored_f(f)
-ignored_f(ir, f::Variable) = ignored_f(ir[f])
+ignored_f(ir, f::Variable) = ignored_f(get(ir, f, nothing))
 
 ignored(ir, ex) = isexpr(ex, :call) && ignored_f(ir, ex.args[1])
 ignored(ir, ex::Variable) = ignored(ir, ir[ex])
 
-# TODO: remove this once we don't mess with type inference
-function _forward_type(Ts)
-  usetyped || return Any
-  all(T -> isconcretetype(T) || T <: DataType, Ts) || return Any
-  T = Core.Compiler.return_type(_forward, Tuple{Context,Ts...})
-  return T == Union{} ? Any : T
-end
-
-isvalidtype(jT, yT) = jT <: Tuple && length(jT.parameters) == 2 && jT.parameters[1] <: yT
-
 function primal(ir::IR)
   pr = Pipe(ir)
   pbs = Dict{Variable,Variable}()
-  for i = 0:length(ir.args)
-    substitute!(pr, arg(i), arg(i+2))
-  end
+  argument!(pr, at = 1)
+  cx = argument!(pr, Context, at = 2)
   for (v, st) in pr
     ex = st.expr
     if isexpr(ex, :call) && !ignored(ir, ex)
-      yT = exprtype(ir, v)
-      T = _forward_type(exprtype.((ir,), ex.args))
-      if yT == Any || isvalidtype(T, yT)
-        yJ = insert!(pr, v, stmt(xcall(Zygote, :_forward, Argument(0), ex.args...),
-                                 line = ir[v].line))
-        pr[v] = xgetindex(yJ, 1)
-        J = insertafter!(pr, v, stmt(xgetindex(yJ, 2),
-                                     type = T == Any ? Any : T.parameters[2],
-                                     line = ir[v].line))
-        pbs[v] = substitute(pr, J)
-      else
-        yJ = insert!(pr, v, xcall(Zygote, :_forward, Argument(0), ex.args...))
-        y =  insert!(pr, v, xgetindex(yJ, 1))
-        J =  insert!(pr, v, stmt(xgetindex(yJ, 2), line = ir[v].line))
-        pr[v] = xcall(Zygote, :typeassert, y, yT)
-        pbs[v] = substitute(pr, J)
-      end
+      yJ = insert!(pr, v, stmt(xcall(Zygote, :_pullback, cx, ex.args...),
+                               line = ir[v].line))
+      pr[v] = xgetindex(yJ, 1)
+      J = insertafter!(pr, v, stmt(xgetindex(yJ, 2),
+                                   line = ir[v].line))
+      pbs[v] = substitute(pr, J)
     end
   end
   pr = finish(pr)
-  pushfirst!(pr.args, typeof(_forward), Context)
   pr, brs = record_branches!(pr)
   return pr, brs, pbs
 end
@@ -152,7 +169,7 @@ end
 function Primal(ir::IR; varargs = nothing)
   ir = instrument(normalise!(ir))
   pr, brs, pbs = primal(ir)
-  Primal(allspats!(ir), pr, varargs, brs, pbs)
+  Primal(expand!(ir), pr, varargs, brs, pbs)
 end
 
 # Backwards Pass
@@ -167,7 +184,7 @@ alpha(x) = x
 alpha(x::Variable) = Alpha(x.id)
 Variable(a::Alpha) = Variable(a.id)
 
-sig(b::IRTools.Block) = unique([arg for br in branches(b) for arg in br.args if arg isa Union{Argument,Variable}])
+sig(b::IRTools.Block) = unique([arg for br in branches(b) for arg in br.args if arg isa Variable])
 sig(pr::Primal) = Dict(b.id => sig(b) for b in blocks(pr.ir))
 
 # TODO unreachables?
@@ -215,22 +232,23 @@ function adjoint(pr::Primal)
     end
     # Backprop through statements
     for v in reverse(keys(b))
+      ex = b[v].expr
       if haskey(pr.pullbacks, v)
         g = push!(rb, stmt(Expr(:call, alpha(pr.pullbacks[v]), grad(v)),
                            line = b[v].line))
-        for (i, x) in enumerate(b[v].expr.args)
-          x isa Union{Variable,Argument} || continue
+        for (i, x) in enumerate(ex.args)
+          x isa Variable || continue
           grad(x, push!(rb, stmt(xgradindex(g, i),
                                  line = b[v].line)))
         end
-      elseif b[v].expr isa Core.PiNode
-        grads[b[v].expr.val] = grads[v]
-      elseif isexpr(b[v].expr, GlobalRef, :call, :isdefined)
-      else
-        ex = b[v].expr
-        desc = isexpr(ex) ? "$(ex.head) expression" : ex
-        push!(rb, stmt(xcall(Base, :error, "Can't differentiate $desc"),
+      elseif ex isa Core.PiNode
+        grads[ex.val] = grads[v]
+      elseif isexpr(ex, GlobalRef, :call, :isdefined, :inbounds, :meta)
+      elseif isexpr(ex)
+        push!(rb, stmt(xcall(Base, :error, "Can't differentiate $(ex.head) expression"),
                        line = b[v].line))
+      else # A literal value
+        continue
       end
     end
     if b.id > 1 # Backprop through (predecessor) branch arguments
@@ -246,7 +264,7 @@ function adjoint(pr::Primal)
         end
       end
     else # Backprop function arguments
-      gs = [grad(arg(i)) for i = 1:length(pr.ir.args)]
+      gs = [grad(arg) for arg = arguments(pr.ir)]
       Δ = push!(rb, pr.varargs == nothing ?
                       xcall(Zygote, :tuple, gs...) :
                       xcall(Zygote, :tuple_va, Val(pr.varargs), gs...))
@@ -263,7 +281,7 @@ end
 
 function Adjoint(ir::IR; varargs = nothing, normalise = true)
   pr = Primal(ir, varargs = varargs)
-  adj = adjoint(pr) |> trimspats!
+  adj = adjoint(pr) |> prune!
   if normalise
     permute!(adj, length(adj.blocks):-1:1)
     adj = IRTools.domorder!(adj) |> IRTools.renumber

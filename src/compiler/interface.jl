@@ -1,12 +1,20 @@
-mutable struct Context
-  cache::Union{IdDict{Any,Any},Nothing}
-  globals::Union{Dict{GlobalRef,Any},Nothing}
+using InteractiveUtils
+using InteractiveUtils: typesof
+using Core: Typeof
+
+@static if VERSION >= v"1.1"
+  import Base: copy!
+else
+  import Future: copy!
 end
 
-Context() = Context(nothing, nothing)
+mutable struct Context <: AContext
+  cache::Union{IdDict{Any,Any},Nothing}
+end
+
+Context() = Context(nothing)
 
 cache(cx::Context) = cx.cache === nothing ? (cx.cache = IdDict()) : cx.cache
-globals(cx::Context) = cx.globals === nothing ? (cx.globals = Dict{GlobalRef,Any}()) : cx.globals
 
 struct Pullback{S,T}
   t::T
@@ -27,23 +35,22 @@ end
 # interface2.jl
 
 # Wrappers
-
-_forward(f, args...) = _forward(Context(), f, args...)
+_pullback(f, args...) = _pullback(Context(), f, args...)
 
 tailmemaybe(::Nothing) = nothing
 tailmemaybe(x::Tuple) = Base.tail(x)
 
-function forward(f, args...)
-  y, back = _forward(f, args...)
+function pullback(f, args...)
+  y, back = _pullback(f, args...)
   y, Δ -> tailmemaybe(back(Δ))
 end
 
 sensitivity(y::Number) = one(y)
 sensitivity(y::Complex) = error("Output is complex, so the gradient is not defined.")
-sensitivity(y) = error("Output should be scalar; gradients are not defined for output $y")
+sensitivity(y) = error("Output should be scalar; gradients are not defined for output $(repr(y))")
 
 function gradient(f, args...)
-  y, back = forward(f, args...)
+  y, back = pullback(f, args...)
   return back(sensitivity(y))
 end
 
@@ -53,12 +60,12 @@ Base.adjoint(f::Function) = x -> gradient(f, x)[1]
 
 # TODO store ids only
 struct Params
-  order::Vector{Any}
+  order::Buffer{Any, Vector{Any}}
   params::IdSet{Any}
-  Params() = new([], IdSet())
+  Params() = new(Buffer([], false), IdSet())
 end
 
-@forward Params.order Base.iterate, Base.length
+@forward Params.order Base.iterate, Base.length, Base.getindex
 
 function Base.push!(ps::Params, x)
   if !(x in ps.params)
@@ -70,7 +77,20 @@ end
 
 Base.push!(ps::Params, x...) = (foreach(x -> push!(ps, x), x); ps)
 
+function Base.delete!(ps::Params, x)
+  if x in ps.params
+    delete!(ps.params, x)
+    i = findfirst(y -> y === x, ps.order)
+    deleteat!(ps.order, i)
+  end
+  return ps
+end
+
 Params(xs) = push!(Params(), xs...)
+
+Base.Broadcast.broadcasted(f, ps::Params) = broadcasted(f, ps.order)
+
+Base.:(==)(x::Params, y::Params) = x.order.data == y.order.data
 
 function Base.show(io::IO, ps::Params)
   print(io, "Params([")
@@ -78,8 +98,39 @@ function Base.show(io::IO, ps::Params)
   print(io, "])")
 end
 
+
+"""
+    copy!(ps::Params, x::AbstractVector)
+    copy!(x::AbstractVector, ps::Params)
+
+Copies the content of array `x` into the parameters `ps` or viceversa.
+The length of `x` has to be equal to the sum of the lengths
+of all parameters.
+"""
+function copy!(ps::Params, x::AbstractVector)
+  @assert length(x) == sum(length(p) for p in ps)
+  i = 0
+  for p in ps
+      p .= reshape(x[i+1:i+length(p)], size(p))
+      i += length(p)
+  end
+  ps
+end
+
+function copy!(x::AbstractVector, ps::Params)
+  @assert length(x) == sum(length(p) for p in ps)
+  i = 0
+  for p in ps
+      x[i+1:i+length(p)] .= vec(p)
+      i += length(p)
+  end
+  ps
+end
+
+
 struct Grads
   grads::IdDict{Any,Any}
+  params::Params
 end
 
 Base.show(io::IO, ps::Grads) = print(io, "Grads(...)")
@@ -91,23 +142,44 @@ function Base.getindex(gs::Grads, x)
   return gs.grads[x]
 end
 
-function forward(f, ps::Params)
+"""
+    copy!(gs::Grads, x::AbstractVector)
+    copy!(x::AbstractVector, gs::Grads)
+
+Copies the content of array `x` into the gradient object `gs` or vice versa. The
+length of `x` has to be equal to the sum of the lengths of all gradients.
+"""
+function copy!(gs::Grads, x::AbstractVector)
+  i = 0
+  for p in gs.params
+      gs[p] .= reshape(x[i+1:i+length(p)], size(p))
+      i += length(p)
+  end
+  x
+end
+
+function copy!(x::AbstractVector,  gs::Grads)
+  i = 0
+  for p in gs.params
+      x[i+1:i+length(p)] .= vec(gs[p])
+      i += length(p)
+  end
+  x
+end
+
+function pullback(f, ps::Params)
   cx = Context()
-  y, back = _forward(cx, f)
+  y, back = _pullback(cx, f)
   y, function (Δ)
     for p in ps
       cache(cx)[p] = nothing
     end
     back(Δ)
-    Grads(cx.cache) # TODO make a copy
+    Grads(cx.cache, ps) # TODO make a copy
   end
 end
 
 # Code Reflection
-
-using InteractiveUtils
-using InteractiveUtils: typesof
-using Core: Typeof
 
 function code_ir(f, T)
   m = meta(Tuple{Typeof(f),T.parameters...})
