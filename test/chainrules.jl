@@ -1,16 +1,20 @@
-using Zygote, Test, ChainRules
+using ChainRulesCore
+using ChainRulesTestUtils
+using Zygote: ZygoteRuleConfig
+using LinearAlgebra
+using FillArrays: Fill
+using LogExpFunctions: logaddexp
 
-
-@testset "ChainRules Integration" begin
-    @testset "basic" begin
+@testset "ChainRules integration" begin
+    @testset "ChainRules basics" begin
         cr_inner_demo_rrule_hitcount = Ref(0)
         cr_inner_demo_pullback_hitcount = Ref(0)
         cr_inner_demo(x) = 5x
-        function ChainRules.rrule(::typeof(cr_inner_demo), x)
+        function ChainRulesCore.rrule(::typeof(cr_inner_demo), x)
             cr_inner_demo_rrule_hitcount[] += 1
             function cr_inner_demo_pullback(Δx)
                 cr_inner_demo_pullback_hitcount[] += 1
-                return ChainRules.NO_FIELDS, 5.0*Δx
+                return NoTangent(), 5.0*Δx
             end
             return cr_inner_demo(x), cr_inner_demo_pullback
         end
@@ -19,6 +23,7 @@ using Zygote, Test, ChainRules
             2 + 10cr_inner_demo(x)
         end
 
+        #
 
         @testset "gradient inner" begin
             cr_inner_demo_rrule_hitcount[] = 0
@@ -55,19 +60,19 @@ using Zygote, Test, ChainRules
         simo_rrule_hitcount = Ref(0)
         simo_pullback_hitcount = Ref(0)
         simo(x) = (5x, 7x)
-        function ChainRules.rrule(::typeof(simo), x)
+        function ChainRulesCore.rrule(::typeof(simo), x)
             simo_rrule_hitcount[] += 1
             function simo_pullback((Δa, Δb))
                 simo_pullback_hitcount[] += 1
-                return ChainRules.NO_FIELDS, 5*Δa + 7*Δb
+                return NoTangent(), 5*Δa + 7*Δb
             end
             return simo(x), simo_pullback
         end
 
         simo_outer(x) = sum(simo(x))
 
-        @assert simo_rrule_hitcount[] == 0
-        @assert simo_pullback_hitcount[] == 0
+        simo_rrule_hitcount[] = 0
+        simo_pullback_hitcount[] = 0
         @test (12,) == Zygote.gradient(simo_outer, π)
         @test simo_rrule_hitcount[] == 1
         @test simo_pullback_hitcount[] == 1
@@ -77,19 +82,20 @@ using Zygote, Test, ChainRules
         miso_rrule_hitcount = Ref(0)
         miso_pullback_hitcount = Ref(0)
         miso(a, b) = 5a + 7b
-        function ChainRules.rrule(::typeof(miso), a, b)
+        function ChainRulesCore.rrule(::typeof(miso), a, b)
             miso_rrule_hitcount[] += 1
             function miso_pullback(Δy)
                 miso_pullback_hitcount[] += 1
-                return ChainRules.NO_FIELDS, 5Δy , 7Δy
+                return NoTangent(), 5Δy , 7Δy
             end
             return miso(a, b), miso_pullback
         end
 
+
         miso_outer(x) = miso(100x, 10x)
 
-        @assert miso_rrule_hitcount[] == 0
-        @assert miso_pullback_hitcount[] == 0
+        miso_rrule_hitcount[] = 0
+        miso_pullback_hitcount[] = 0
         @test (570,) == Zygote.gradient(miso_outer, π)
         @test miso_rrule_hitcount[] == 1
         @test miso_pullback_hitcount[] == 1
@@ -99,17 +105,17 @@ using Zygote, Test, ChainRules
         mimo_rrule_hitcount = Ref(0)
         mimo_pullback_hitcount = Ref(0)
         mimo(a, b) = (5a + 7b, 100a, 10b)
-        function ChainRules.rrule(::typeof(mimo), a, b)
+        function ChainRulesCore.rrule(::typeof(mimo), a, b)
             mimo_rrule_hitcount[] += 1
             function mimo_pullback((Δx, Δy, Δz))
                 mimo_pullback_hitcount[] += 1
-                return ChainRules.NO_FIELDS, 5Δx + 100Δy , 7Δx + 10Δz
+                return NoTangent(), 5Δx + 100Δy , 7Δx + 10Δz
             end
             return mimo(a, b), mimo_pullback
         end
 
-        @assert mimo_rrule_hitcount[] == 0
-        @assert mimo_pullback_hitcount[] == 0
+        mimo_rrule_hitcount[] = 0
+        mimo_pullback_hitcount[] = 0
         _, pb = Zygote.pullback(mimo, π, 2π)
         @test (105, 17) == pb((1, 1, 1))
         @test mimo_rrule_hitcount[] == 1
@@ -129,12 +135,13 @@ using Zygote, Test, ChainRules
         # to a single `nothing` if they are all zero-like.
 
         not_diff_eg(x, i) = [10, 20][i]
-        function ChainRules.rrule(::typeof(not_diff_eg), x, i)
+        function ChainRulesCore.rrule(::typeof(not_diff_eg), x, i)
             function not_diff_eg_pullback(Δ)
-                return ChainRules.NO_FIELDS, ChainRules.Zero(), ChainRules.DoesNotExist()
+                return NoTangent(), ZeroTangent(), NoTangent()
             end
             return not_diff_eg(x, i), not_diff_eg_pullback
         end
+
 
         _, pb = Zygote.pullback(not_diff_eg, 10.4, 2)
         @test pb(1.2) === nothing
@@ -160,14 +167,10 @@ using Zygote, Test, ChainRules
 
         @test (1,) == h(1)
 
-        if VERSION >= v"1.6-"
-            @test begin
-                a3, pb3 = Zygote.pullback(h, 1)
-                ((1,),) == pb3(1)
-            end
-        else
+
+        @test begin
             a3, pb3 = Zygote.pullback(h, 1)
-            @test ((1,),) == pb3(1)
+            ((1,),) == pb3(1)
         end
     end
 
@@ -175,14 +178,15 @@ using Zygote, Test, ChainRules
         kwfoo_rrule_hitcount = Ref(0)
         kwfoo_pullback_hitcount = Ref(0)
         kwfoo(x; k=10) = x + k
-        function ChainRules.rrule(::typeof(kwfoo), x; k=10)
+        function ChainRulesCore.rrule(::typeof(kwfoo), x; k=10)
             kwfoo_rrule_hitcount[] += 1
             function kwfoo_pullback(Δy)
                 kwfoo_pullback_hitcount[] += 1
-                return ChainRules.NO_FIELDS, Δy
+                return NoTangent(), Δy
             end
             return kwfoo(x; k=k), kwfoo_pullback
         end
+
 
         kwfoo_outer_unused(x) = kwfoo(x)
         kwfoo_outer_used(x) = kwfoo(x; k=-15)
@@ -196,21 +200,183 @@ using Zygote, Test, ChainRules
         end
     end
 
-
     @testset "kwarg, with all AbstractZero partials" begin
         # while ChainRules always has a partial for every input, Zygote combined them all
         # to a single `nothing` if they are all zero-like.
 
         not_diff_kw_eg(x, i; kw=1.0) = [10, 20][i]
-        function ChainRules.rrule(::typeof(not_diff_kw_eg), x, i; kwargs...)
+        function ChainRulesCore.rrule(::typeof(not_diff_kw_eg), x, i; kwargs...)
             function not_diff_kw_eg_pullback(Δ)
-                return ChainRules.NO_FIELDS, ChainRules.Zero(), ChainRules.DoesNotExist()
+                return NoTangent(), ZeroTangent(), NoTangent()
             end
             return not_diff_kw_eg(x, i; kwargs...), not_diff_kw_eg_pullback
         end
 
+
         @test (nothing,) == Zygote.gradient(x->not_diff_kw_eg(x, 2), 10.4)
         @test (nothing,) == Zygote.gradient(x->not_diff_kw_eg(x, 2; kw=2.0), 10.4)
+    end
+
+    @testset "Type only rrule" begin
+        struct StructForTestingTypeOnlyRRules{T}
+            x::T
+        end
+        StructForTestingTypeOnlyRRules() = StructForTestingTypeOnlyRRules(1.0)
+
+        function ChainRulesCore.rrule(P::Type{<:StructForTestingTypeOnlyRRules})
+            # notice here we mess with the primal doing 2.0 rather than 1.0, this is for testing purposes
+            # and also because apparently people actually want to do this. Weird, but 🤷
+            # https://github.com/SciML/SciMLBase.jl/issues/69#issuecomment-865639754
+            P(2.0),  _ -> (NoTangent(),)
+        end
+
+        @assert StructForTestingTypeOnlyRRules().x == 1.0
+        aug_primal_val, _ = Zygote.pullback(x->StructForTestingTypeOnlyRRules(), 1.2)
+        @test aug_primal_val.x == 2.0
+    end
+
+    @testset "@opt_out" begin
+        oout_id(x) = x
+        oout_id_rrule_hitcount = Ref(0)
+        function ChainRulesCore.rrule(::typeof(oout_id), x::Any)
+            oout_id_rrule_hitcount[] += 1
+            oout_id_pullback(ȳ) = (NoTangent(), ȳ)
+            return oout_id(x), oout_id_pullback
+        end
+
+        @opt_out ChainRulesCore.rrule(::typeof(oout_id), x::AbstractArray)
+
+        # Hit one we haven't opted out
+        oout_id_rrule_hitcount[] = 0
+        oout_id_outer(x) = sum(oout_id(x))
+        @test (1.0,) == Zygote.gradient(oout_id_outer, π)
+        @test oout_id_rrule_hitcount[] == 1
+
+        # make sure don't hit the one we have opted out
+        oout_id_rrule_hitcount[] = 0
+        @test ([1.0],) == Zygote.gradient(oout_id_outer, [π])
+        @test oout_id_rrule_hitcount[] == 0
+
+        # Now try opting out After we have already used it
+        @opt_out ChainRulesCore.rrule(::typeof(oout_id), x::Real)
+        oout_id_rrule_hitcount[] = 0
+        @test (1.0,) == Zygote.gradient(oout_id_outer, π)
+        @test oout_id_rrule_hitcount[] == 0
+    end
+
+    # issue #1204
+    @testset "NotImplemented" begin
+        f_notimplemented(x) = x
+        @scalar_rule f_notimplemented(x) @not_implemented("not implemented :(")
+        @test Zygote.gradient(f_notimplemented, 0.1) === (nothing,)
+        @test Zygote.gradient(x -> f_notimplemented(x[1]), 0.1) === (nothing,)
+        if isdefined(Base, :only)
+            @test Zygote.gradient(x -> f_notimplemented(only(x)), (0.1,)) === (nothing,)
+            @test Zygote.gradient(x -> f_notimplemented(only(x)), [0.1]) === (nothing,)
+        end
+    end
+
+    # https://github.com/FluxML/Zygote.jl/issues/1234
+    @testset "rrule lookup ambiguities" begin
+      @testset "unconfigured" begin
+        f_ambig(x, y) = x + y
+        ChainRulesCore.rrule(::typeof(f_ambig), x::Int, y) = x + y, _ -> (0, 0)
+        ChainRulesCore.rrule(::typeof(f_ambig), x, y::Int) = x + y, _ -> (0, 0)
+
+        @test_throws MethodError pullback(f_ambig, 1, 2)
+      end
+      @testset "configured" begin
+        h_ambig(x, y) = x + y
+        ChainRulesCore.rrule(::ZygoteRuleConfig, ::typeof(h_ambig), x, y) = x + y, _ -> (0, 0)
+        ChainRulesCore.rrule(::RuleConfig, ::typeof(h_ambig), x::Int, y::Int) = x + y, _ -> (0, 0)
+
+        @test_throws MethodError pullback(h_ambig, 1, 2)
+      end
+    end
+end
+
+@testset "ChainRulesCore.rrule_via_ad" begin
+    @testset "basic" begin
+        # Not marked as tests since perhaps ZeroTangent would be better.
+        rrule_via_ad(ZygoteRuleConfig(), round, 2.2)[2](1) == (NoTangent(), 0.0)
+        # But test_rrule is happy:
+        test_rrule(ZygoteRuleConfig(), round, 2.2; rrule_f=rrule_via_ad)
+
+        test_rrule(ZygoteRuleConfig(), vcat, rand(3), rand(4); rrule_f=rrule_via_ad)
+        test_rrule(ZygoteRuleConfig(), getindex, rand(5), 3; rrule_f=rrule_via_ad)
+    end
+
+    @testset "kwargs" begin
+        test_rrule(
+            ZygoteRuleConfig(), sum, [1.0 2; 3 4];
+            rrule_f=rrule_via_ad, check_inferred=false, fkwargs=(;dims=1)
+        )
+    end
+
+    @testset "struct" begin
+        struct Foo
+            x
+            y
+        end
+        makefoo(a, b) = Foo(a, b)
+        sumfoo(foo) = foo.x + foo.y
+
+
+        test_rrule(
+            ZygoteRuleConfig(), sumfoo, Foo(1.2, 2.3); rrule_f=rrule_via_ad, check_inferred=false
+        )
+        test_rrule(
+            ZygoteRuleConfig(), makefoo, 1.0, 2.0;
+            rrule_f=rrule_via_ad, check_inferred=false
+        )
+    end
+
+    @testset "tuples/namedtuples" begin
+        my_tuple(a, b, c) = (a+b, b+c)
+        my_namedtuple(a, b, c) = (a=a, b=b, c=0.0)
+
+        test_rrule(
+            ZygoteRuleConfig(), my_tuple, 1., 2., 3.; rrule_f=rrule_via_ad
+        )
+        test_rrule(
+            ZygoteRuleConfig(), my_namedtuple, 1., 2., 3.; rrule_f=rrule_via_ad
+        )
+        test_rrule(
+            ZygoteRuleConfig(), my_namedtuple, 1., (2.0, 2.4), 3.; rrule_f=rrule_via_ad
+        )
+        test_rrule(
+            ZygoteRuleConfig(), sum, (1.0, 2.0, 3.0); rrule_f=rrule_via_ad, check_inferred=false
+        )
+        test_rrule(
+            ZygoteRuleConfig(), sum, (a=1.0, b=2.0); rrule_f=rrule_via_ad, check_inferred=false
+        )
+        # There is at present no rrule for sum(::Tuple), so those are testing zygote directly.
+    end
+
+    @testset "arrays" begin
+        nada(x, y) = 1.0
+        test_rrule(ZygoteRuleConfig(), nada, rand(3), rand(2,3); rrule_f=rrule_via_ad)
+        test_rrule(ZygoteRuleConfig(), +, rand(3), rand(3); rrule_f=rrule_via_ad)
+        test_rrule(ZygoteRuleConfig(), *, rand(1, 3), rand(3); rrule_f=rrule_via_ad)
+    end
+
+    @testset "rules which call rrule_via_ad" begin
+        # since cbrt has a rule, this will test the shortcut:
+        test_rrule(ZygoteRuleConfig(), sum, cbrt, randn(5))
+        test_rrule(ZygoteRuleConfig(), sum, cbrt, randn(5); rrule_f=rrule_via_ad)
+
+        # but x -> cbrt(x) has no rule, so will be done by Zygote
+        # increased tolerances because these are occasionally flaky at rtol=1e-9
+        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5); rtol=1e-8)
+        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5); rtol=1e-8,
+                   rrule_f=rrule_via_ad)
+    end
+
+    # See https://github.com/FluxML/Zygote.jl/issues/1078
+    @testset "ProjectTo{AbstractArray}(::Tangent{Any})" begin
+        X = UpperHessenberg(randn(5, 5))
+        dX = Tangent{Any}(element=randn(5, 5))
+        @test ProjectTo(X)(dX) === dX
     end
 end
 
@@ -218,4 +384,138 @@ end
     @test gradient(2.0) do x
       @fastmath x^2.0
     end == (4.0,)
+
+    @test gradient(2) do x
+      @fastmath log(x)
+    end == (1/2,)
+end
+
+@testset "zygote2differential inference" begin
+    @test @inferred(Zygote.z2d(1.0, 2.0)) isa Real
+    @test @inferred(Zygote.z2d([1,2,3], [4,5,6])) isa Vector
+    @test @inferred(Zygote.z2d((1, 2.0, 3+4im), (5, 6.0, 7+8im))) isa Tangent{<:Tuple}
+
+    # Below Julia 1.7, these need a @generated version to be inferred:
+    @test @inferred(Zygote.z2d((re=1,), 3.0+im)) isa Tangent{ComplexF64}
+    @test @inferred(Zygote.z2d((re=1, im=nothing), 3.0+im)) isa Tangent{ComplexF64}
+
+    # collapse nothings
+    @test @inferred(Zygote.z2d((nothing,), (1,))) === NoTangent()
+    @test @inferred(Zygote.z2d((nothing, nothing), (1,2))) === NoTangent()
+
+    # To test the generic case, we need a struct within a struct.
+    nested = Tangent{Base.RefValue{ComplexF64}}(; x=Tangent{ComplexF64}(; re=1, im=NoTangent()),)
+    @test @inferred(Zygote.z2d((; x=(; re=1)), Ref(3.0+im))) == nested
+    @test @inferred(Zygote.z2d((; x=(; re=nothing)), Ref(3.0+im))) === NoTangent()
+
+    x = (c = (a = randn(3,3), b = rand(3)), d = randn(5))
+    z2d_compiled = Zygote.z2d(x, x)
+    z2d_fallback = Zygote._z2d_struct_fallback(x, x)
+    @test z2d_compiled.d === z2d_fallback.d
+    @test z2d_compiled.c.a === z2d_fallback.c.a
+    @test z2d_compiled.c.b === z2d_fallback.c.b
+end
+
+@testset "ChainRules translation" begin
+    @test Zygote.wrap_chainrules_input(nothing) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input((nothing,)) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input([nothing]) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input(((1.0, 2.0), 3.0)) == Tangent{Any}(Tangent{Any}(1.0, 2.0), 3.0)
+    @test Zygote.wrap_chainrules_input((; a = 1.0, b = 2.0)) == Tangent{Any}(a = 1.0, b = 2.0)
+    @test Zygote.wrap_chainrules_input(Ref(1)) == 1
+    @test Zygote.wrap_chainrules_input([2.0; 4.0]) == [2.0; 4.0]
+    @test Zygote.wrap_chainrules_input([[2.0; 4.0], [1.0; 3.0]]) == [[2.0; 4.0], [1.0; 3.0]]
+    @test Zygote.wrap_chainrules_input([nothing; 4.0]) == [0.0; 4.0] # ChainRules uses the numeric zero where possible
+end
+
+@testset "Lazy" begin
+    custom_add(x, y) = x + y
+    function ChainRulesCore.rrule(::typeof(custom_add), x, y)
+        function pullback(Δ)
+            return NoTangent(), unthunk(Δ), @thunk(error("Should not compute."))
+        end
+        custom_add(x, y), pullback
+    end
+
+    x, y = 1f0, 1f0
+    Zygote.gradient(x) do x
+        sum(custom_add(x, y))
+    end
+end
+
+@testset "Deferred scalar cotangents in accum and scalar rules" begin
+    # https://github.com/FluxML/Zygote.jl/issues/1741
+    nevals = Ref(0)
+    scale(x, s) = x * s
+    function ChainRulesCore.rrule(::typeof(scale), x::AbstractArray, s::Number)
+        scale_pullback(Δ) = (NoTangent(), @thunk(unthunk(Δ) * s), @thunk((nevals[] += 1; dot(unthunk(Δ), x))))
+        return scale(x, s), scale_pullback
+    end
+    kwscale(s; k) = k * s
+    function ChainRulesCore.rrule(::typeof(kwscale), s::Number; k)
+        return kwscale(s; k), Δ -> (NoTangent(), k * Δ)
+    end
+    x, t = [0.5, -2.0, 3.0], 4.0
+
+    # not computed for a constant, through scalar rules (`inv` and `-` as in NNlib and Flux's losses)
+    for (f, dx) in [(x -> sum(scale(x, 1 - t)), -3.0), (x -> sum(scale(x, inv(sqrt(t)))), 0.5),
+                    (x -> sum(scale(x, t)) + sum(scale(x, 1 - t)), 1.0),
+                    (x -> sum((x .+ t) .* scale(x, t)), 2t .* x .+ t^2), (x -> sum(scale(x, t)) + t^2, t),
+                    (x -> sum(scale(x, logaddexp(t, 1.0))), logaddexp(t, 1.0)),
+                    (x -> sum(scale(x, kwscale(t; k = 2))), 2t),
+                    (x -> (y = 0.0; for i in 1:2; y += sum(scale(x, i * t)); end; y), 3t)]
+        nevals[] = 0
+        @test gradient(f, x)[1] ≈ dx .* ones(3)
+        @test nevals[] == 0
+    end
+    # computed once, for both arguments of `-`
+    nevals[] = 0
+    @test gradient((a, b) -> sum(scale(x, a - b)), 1.0, t) == (sum(x), -sum(x))
+    @test nevals[] == 1
+
+    # deferred, with the right value
+    s = 0.25
+    for (f, ds) in [((x, s) -> sum((x .+ s) .* (x .- s)), -6s), ((x, s) -> sum(x .+ s) + sum(x .* s), 3 + sum(x)),
+                    ((x, s) -> sum(x .+ inv(s)), -3 / s^2), ((x, s) -> sum(x .* (1 - s)), -sum(x)),
+                    ((x, s) -> sum(x .* Fill(s, 3)), sum(x))]
+        dxs = Zygote._pullback(Zygote.Context(), f, x, s)[2](1.0)
+        @test dxs[3] isa AbstractThunk
+        @test unthunk(dxs[3]) ≈ ds
+        @test gradient(f, x, s)[2] ≈ ds
+    end
+    # a non-differentiable rule never computes it
+    @test Zygote._pullback(Zygote.Context(), s -> sum(x .+ (s > 0)), 0.25)[2](1.0)[2] === nothing
+
+    # nested AD evaluates them eagerly
+    @test gradient(a -> gradient(s -> sum(x .* (1 - s)) + sum((x .+ s) .* (x .- s)), a)[1], 2.0)[1] ≈ -6
+end
+
+@testset "No thunks in the gradient" begin
+    struct CustomDense
+        w::Matrix{Float32}
+    end
+    (d::CustomDense)(x) = d.w * x
+
+    layers = [CustomDense(rand(Float32, 3, 3))]
+    x = ones(Float32, 3)
+    g = gradient(layers -> sum(layers[1](x)), layers)[1]
+    @test g[1] isa NamedTuple
+    @test g[1].w isa Array
+end
+
+@testset "Accumulated thunks of rules in Zygote's format" begin
+    # https://github.com/JuliaGraphs/GraphNeuralNetworks.jl/issues/731
+    # the `getindex` rule's thunks hold `ZeroTangent()`s, which the broadcast's pullback can't take
+    xs, b = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], [0.5, 0.5]
+    @test gradient(xs -> (ys = map(x -> x .+ b, xs); sum(ys[1]) + sum(ys[2])), xs)[1] ==
+          [[1.0, 1.0], [1.0, 1.0], nothing]
+
+    struct TwoFields
+        a::Float64
+        b::Float64
+    end
+    first_field(t::TwoFields) = t.a
+    ChainRulesCore.rrule(::typeof(first_field), t::TwoFields) =
+        t.a, Δ -> (NoTangent(), @thunk(Tangent{TwoFields}(a = Δ)))
+    @test gradient(a -> (t = TwoFields(a, 2.0); first_field(t) + first_field(t)), 1.0) == (2.0,)
 end

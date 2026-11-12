@@ -2,25 +2,39 @@ using Random, FillArrays, AbstractFFTs
 using FillArrays: AbstractFill, getindex_value
 using Base.Broadcast: broadcasted, broadcast_shape
 using Distributed: pmap, AbstractWorkerPool
-
-@adjoint (::Type{T})(::UndefInitializer, args...) where T<:Array = T(undef, args...), Δ -> nothing
+using LinearAlgebra: Diagonal, Hermitian, LowerTriangular, UpperTriangular
+using LinearAlgebra: UnitLowerTriangular, UnitUpperTriangular
+using LinearAlgebra: BlasFloat, ColumnNorm, LU, QRPivoted
 
 @adjoint Array(xs::AbstractArray) = Array(xs), ȳ -> (ȳ,)
 @adjoint Array(xs::Array) = Array(xs), ȳ -> (ȳ,)
 
-@nograd ones, zeros, Base.OneTo, Colon(), one, zero, sizehint!
-
-@adjoint Base.vect(xs...) = Base.vect(xs...), Δ -> (Δ...,)
-
 @adjoint copy(x::AbstractArray) = copy(x), ȳ -> (ȳ,)
 
-@adjoint collect(x::Tuple) = collect(x), dy -> (Tuple(dy),)
-@adjoint collect(x::AbstractArray) = collect(x), dy -> (dy,)
+@adjoint function collect(x::Tuple)
+  collect_tuple_pullback(dy) = (Tuple(dy),)
+  collect(x), collect_tuple_pullback
+end
+
+@adjoint function collect(x::NamedTuple{names}) where names
+  collect_namedtuple_pullback(dy) = (NamedTuple{names}(Tuple(dy)),)
+  collect(x), collect_namedtuple_pullback
+end
+
+@adjoint function collect(x::AbstractArray)
+  collect_array_pullback(dy) = (dy,)
+  collect(x), collect_array_pullback
+end
+
+@adjoint function collect(d::Dict)
+  _keys = collect(keys(d))
+  collect_dict_pullback(Δ) = (reconstruct_if_dict(Δ, _keys),)
+  collect(d), collect_dict_pullback
+end
 
 # Array Constructors
-@adjoint (::Type{T})(x::T) where T<:Array = T(x), ȳ -> (ȳ,)
 @adjoint function (::Type{T})(x::Number, sz) where {T <: Fill}
-    back(Δ::AbstractArray) = (sum(Δ), nothing)
+    back(Δ::AbstractArray) = (lazy_cotangent(x, () -> sum(Δ)), nothing)
     back(Δ::NamedTuple) = (Δ.value, nothing)
     return Fill(x, sz), back
 end
@@ -28,21 +42,21 @@ end
 @adjoint (::Type{T})(sz) where {T<:Zeros} = T(sz), Δ->(nothing,)
 @adjoint (::Type{T})(sz) where {T<:Ones} = T(sz), Δ->(nothing,)
 
-@adjoint getindex(x::AbstractArray, inds...) = x[inds...], ∇getindex(x, inds)
+"""
+    OneElement(val, ind, axes) <: AbstractArray
 
-@adjoint view(x::AbstractArray, inds...) = view(x, inds...), ∇getindex(x, inds)
-
-∇getindex(x::AbstractArray, inds) = dy -> begin
-  if inds isa  NTuple{<:Any, Integer}
-    dx = _zero(x, typeof(dy))
-    dx[inds...] = dy
-  else
-    dx = _zero(x, eltype(dy))
-    dxv = view(dx, inds...)
-    dxv .= accum.(dxv, _droplike(dy, dxv))
-  end
-  return (dx, map(_->nothing, inds)...)
+Extremely simple `struct` used for the gradient of scalar `getindex`.
+"""
+struct OneElement{T,N,I,A} <: AbstractArray{T,N}
+  val::T
+  ind::I
+  axes::A
+  OneElement(val::T, ind::I, axes::A) where {T<:Number, I<:NTuple{N,Int}, A<:NTuple{N,AbstractUnitRange}} where {N} = new{T,N,I,A}(val, ind, axes)
 end
+Base.size(A::OneElement) = map(length, A.axes)
+Base.axes(A::OneElement) = A.axes
+Base.getindex(A::OneElement{T,N}, i::Vararg{Int,N}) where {T,N} = ifelse(i==A.ind, A.val, zero(T))
+
 
 _zero(xs::AbstractArray{<:Number}, T::Type{Nothing}) = fill!(similar(xs), zero(eltype(xs)))
 _zero(xs::AbstractArray{<:Number}, T) = fill!(similar(xs, T), false)
@@ -54,50 +68,31 @@ _droplike(dy::Union{LinearAlgebra.Adjoint, LinearAlgebra.Transpose}, dxv::Abstra
 
 @adjoint getindex(::Type{T}, xs...) where {T} = T[xs...], dy -> (nothing, dy...)
 
-@adjoint! setindex!(xs::AbstractArray, x...) = setindex!(xs, x...),
-  _ -> error("Mutating arrays is not supported")
+_throw_mutation_error(f, args...) = error("""
+Mutating arrays is not supported -- called $f($(join(map(typeof, args), ", ")), ...)
+This error occurs when you ask Zygote to differentiate operations that change
+the elements of arrays in place (e.g. setting values with x .= ...)
 
-@adjoint! copyto!(args...) = copyto!(args...),
-  _ -> error("Mutating arrays is not supported")
+Possible fixes:
+- avoid mutating operations (preferred)
+- or read the documentation and solutions for this error
+  https://fluxml.ai/Zygote.jl/latest/limitations
+""")
+
+@adjoint! setindex!(xs::AbstractArray, x...) = setindex!(xs, x...),
+  _ -> _throw_mutation_error(setindex!, xs)
+
+@adjoint! copyto!(xs, args...) = copyto!(xs, args...),
+  _ -> _throw_mutation_error(copyto!, xs)
 
 for f in [push!, pop!, pushfirst!, popfirst!]
-  @eval @adjoint! $f(xs, x...) =
-    push!(xs, x...), _ -> error("Mutating arrays is not supported")
-end
-
-# This is kind of bad, but at least we don't materialize the whole
-# array. Prefer to use `Buffer`
-# function _pullback(cx::Context, ::typeof(push!), xs::AbstractVector{<:AbstractArray}, x::AbstractArray{T}...) where T
-@adjoint! function push!(xs::AbstractVector{<:AbstractArray}, x::AbstractArray{T}...) where T
-  sz_xs = size.(xs)
-  sz_x = size.(x)
-  push!(xs, x...), Δ -> begin
-    (Δ, map(x -> Ones{T}(x...), sz_x)...)
-  end
-end
-
-@adjoint! function pop!(xs::AbstractVector{<:AbstractArray{T}}) where T
-  sz_xs = size.(xs)
-  op = pop!(xs)
-  op, Δ -> begin
-    ([Ones{T}(sz...) for sz in sz_xs], )
-  end
+  @eval @adjoint! $f(x::AbstractVector, ys...) = $f(x, ys...),
+    _ -> _throw_mutation_error($f, x)
 end
 
 # General
 
 @adjoint collect(x::Array) = collect(x), Δ -> (Δ,)
-
-@adjoint fill(x::Real, dims...) = fill(x, dims...), Δ->(sum(Δ), map(_->nothing, dims)...)
-
-@adjoint function circshift(A, shifts)
-  circshift(A, shifts), Δ -> (circshift(Δ, map(-, shifts)), nothing)
-end
-
-@adjoint function reverse(x::AbstractArray, args...; kwargs...)
-  _reverse(t) = reverse(t, args...; kwargs...)
-  _reverse(x), Δ->(_reverse(Δ), map(_->nothing, args)...)
-end
 
 @adjoint permutedims(xs) = permutedims(xs), Δ -> (permutedims(Δ),)
 
@@ -109,57 +104,91 @@ end
 @adjoint PermutedDimsArray(xs, dims) = PermutedDimsArray(xs, dims),
   Δ -> (PermutedDimsArray(Δ, invperm(dims)), nothing)
 
+# `Δ` is normally an array (or an `AbstractThunk`, which `reshape` handles), but it
+# can be a sentinel `nothing`/`AbstractZero` when `xs` is non-differentiable, e.g.
+# `reshape(::Array{Bool}, ...)` (#1567). `reshape` has no method for those, so pass
+# them straight through.
+_reshape_pullback(Δ, sz) = reshape(Δ, sz)
+_reshape_pullback(::Nothing, sz) = nothing
+_reshape_pullback(Δ::AbstractZero, sz) = Δ
+
 @adjoint reshape(xs, dims...) = reshape(xs, dims...),
-  Δ -> (reshape(Δ, size(xs)),map(_->nothing,dims)...)
+  Δ -> (_reshape_pullback(Δ, size(xs)), map(_->nothing,dims)...)
 
-@adjoint function hvcat(rows::Tuple{Vararg{Int}}, xs::Number...)
-  hvcat(rows, xs...), ȳ -> (nothing, permutedims(ȳ)...)
-end
-
-pull_block_vert(sz, Δ, A::Number) = Δ[sz]
-pull_block_vert(sz, Δ, A::AbstractVector) = Δ[sz-length(A)+1:sz]
-pull_block_vert(sz, Δ, A::AbstractMatrix) = Δ[sz-size(A, 1)+1:sz, :]
-@adjoint function vcat(A::Union{AbstractVector, AbstractMatrix, Number}...)
-  sz = cumsum([size.(A, 1)...])
-  return vcat(A...), Δ->(map(n->pull_block_vert(sz[n], Δ, A[n]), eachindex(A))...,)
-end
-@adjoint vcat(xs::Number...) = vcat(xs...), Δ -> (Δ...,)
-
-pull_block_horz(sz, Δ, A::AbstractVector) = Δ[:, sz]
-pull_block_horz(sz, Δ, A::AbstractMatrix) = Δ[:, sz-size(A, 2)+1:sz]
-@adjoint function hcat(A::Union{AbstractVector, AbstractMatrix}...)
-  sz = cumsum([size.(A, 2)...])
-  return hcat(A...), Δ->(map(n->pull_block_horz(sz[n], Δ, A[n]), eachindex(A))...,)
-end
-@adjoint hcat(xs::Number...) = hcat(xs...), Δ -> (Δ...,)
-
-@adjoint function cat(Xs...; dims)
-  cat(Xs...; dims = dims), Δ -> begin
-    start = ntuple(_ -> 0, ndims(Δ))
-    catdims = Base.dims2cat(dims)
-    dXs = map(Xs) do x
-      move = ntuple(d -> (d<=length(catdims) && catdims[d]) ? size(x,d) : 0, ndims(Δ))
-      x_in_Δ = ntuple(d -> (d<=length(catdims) && catdims[d]) ? (start[d]+1:start[d]+move[d]) : Colon(), ndims(Δ))
-      start = start .+ move
-      dx = Δ[x_in_Δ...]
-    end
+# Typed array literals (`Float32[1 0 0 x]`, `Float32[1 0; 0 x]`) and the `;;`/`;;;`
+# n-dimensional concatenation (`[x ;; 1]`) lower to `typed_hcat`/`typed_vcat`/
+# `typed_hvcat`/`hvncat`, none of which have a ChainRules rule, so Zygote tried to
+# differentiate their mutating `setindex!` fallback (#1413, #1572). Reuse the rules
+# for the untyped `hcat`/`vcat`/`hvcat`/`cat`, which produce numerically identical
+# values and identical cotangents (the element type only affects projection).
+for (typed, untyped) in ((:typed_hcat, :hcat), (:typed_vcat, :vcat))
+  @eval function _pullback(cx::AContext, ::typeof(Base.$typed), ::Type{T}, xs...) where {T}
+    y, back = _pullback(cx, $untyped, xs...)
+    $(Symbol(typed, :_pullback))(Δ) = (nothing, nothing, Base.tail(back(Δ))...)
+    return Base.$typed(T, xs...), $(Symbol(typed, :_pullback))
   end
+end
+
+function _pullback(cx::AContext, ::typeof(Base.typed_hvcat), ::Type{T}, rows::Tuple{Vararg{Int}}, xs...) where {T}
+  y, back = _pullback(cx, hvcat, rows, xs...)
+  typed_hvcat_pullback(Δ) = (nothing, nothing, nothing, Base.tail(Base.tail(back(Δ)))...)
+  return Base.typed_hvcat(T, rows, xs...), typed_hvcat_pullback
+end
+
+function _pullback(cx::AContext, ::typeof(Base.hvncat), dim::Int, xs...)
+  catdims(args...) = cat(args...; dims = dim)
+  y, back = _pullback(cx, catdims, xs...)
+  hvncat_pullback(Δ) = (nothing, nothing, Base.tail(back(Δ))...)
+  return y, hvncat_pullback
+end
+
+# Splatting a vector of arrays (`vcat(vs...)`) lowers to `_apply_iterate`, whose generic pullback
+# is specialised on `length(vs)`: the first gradient takes seconds and grows with it (#1687).
+# Reuse the `reduce(vcat/hcat, vs)` rule instead. Vectors and matrices are not mixed because
+# that rule would return matrix cotangents for the vectors.
+const _VecOfVecOrVecOfMat = Union{AbstractVector{<:AbstractVector}, AbstractVector{<:AbstractMatrix}}
+
+for cat in (:vcat, :hcat)
+  @eval function _pullback(cx::AContext, ::typeof(Core._apply_iterate), ::typeof(iterate), ::typeof($cat), xs::_VecOfVecOrVecOfMat)
+    isempty(xs) && return $cat(xs...), _ -> nothing  # `reduce` throws on empty input
+    y, back = _pullback(cx, reduce, $cat, xs)
+    function apply_iterate_cat_pullback(Δ)
+      # ChainRules' `reduce(vcat/hcat)` pullbacks index the cotangent without unthunking it, which is
+      # quadratic for a thunk (JuliaDiff/ChainRules.jl#860); remove once fixed upstream
+      dxs = back(unthunk(Δ))
+      dxs === nothing ? nothing : (nothing, nothing, nothing, dxs[3])
+    end
+    return y, apply_iterate_cat_pullback
+  end
+end
+
+# Splatting a vector of numbers is a reshaped copy, so the cotangent of the vector is that of the result (#1716).
+for cat in (:vcat, :hcat)
+  @eval function _pullback(cx::AContext, ::typeof(Core._apply_iterate), ::typeof(iterate), ::typeof($cat), xs::AbstractVector{<:Number})
+    apply_iterate_cat_pullback(Δ) = (nothing, nothing, nothing, vec(unthunk(Δ)))
+    return $cat(xs...), apply_iterate_cat_pullback
+  end
+end
+
+_repeat_counts(n::Integer) = (n,)
+_repeat_counts(n) = Tuple(n)
+
+# Each dim of the output, of size inner*S*outer, is viewed as (inner, S, outer) with
+# inner varying fastest; the cotangent sums over the inner and outer axes.
+function _repeat_pullback(Δ, xs, inner, outer)
+  inner, outer = _repeat_counts(inner), _repeat_counts(outer)
+  N = max(ndims(xs), length(inner), length(outer))
+  reps(c, d) = d <= length(c) ? c[d] : 1
+  shape = ntuple(3N) do k
+    d, r = fldmod1(k, 3)
+    r == 1 ? reps(inner, d) : r == 2 ? size(xs, d) : reps(outer, d)
+  end
+  sumdims = ntuple(i -> 3 * ((i - 1) ÷ 2) + (isodd(i) ? 1 : 3), 2N)
+  return reshape(sum(reshape(Δ, shape); dims = sumdims), size(xs))
 end
 
 @adjoint function repeat(xs; inner=ntuple(_->1, ndims(xs)), outer=ntuple(_->1, ndims(xs)))
-  repeat(xs, inner = inner, outer = outer), function (Δ)
-    Δ′ = zero(xs)
-    S = size(xs)
-
-    # Loop through each element of Δ, calculate source dimensions, accumulate into Δ′
-    for (dest_idx, val) in pairs(IndexCartesian(), Δ)
-        # First, round dest_idx[dim] to nearest gridpoint defined by inner[dim], then
-        # wrap around based on original size S.
-        src_idx = [mod1(div(dest_idx[dim] - 1, inner[dim]) + 1, S[dim]) for dim in 1:length(S)]
-        Δ′[src_idx...] += val
-    end
-    return (Δ′,)
-  end
+  repeat(xs, inner = inner, outer = outer), Δ -> (_repeat_pullback(Δ, xs, inner, outer),)
 end
 
 @adjoint repeat(x::AbstractVector, m::Integer) =
@@ -172,50 +201,97 @@ end
    end
 end
 
-@adjoint getindex(i::Int, j::Int) = i[j], _ -> nothing
+@_adjoint_keepthunks getindex(i::Int, j::Int) = i[j], _ -> nothing
 
 struct StaticGetter{i} end
 (::StaticGetter{i})(v) where {i} = v[i]
-@generated function _unzip(tuples, ::Val{N}) where {N}
-  Expr(:tuple, (:(map($(StaticGetter{i}()), tuples)) for i ∈ 1:N)...)
+(::StaticGetter{i})(::Nothing) where {i} = nothing
+function _unzip(tuples, ::Val{N}) where {N}
+  getters = ntuple(n -> StaticGetter{n}(), N)
+  map(g -> map(g, tuples), getters)
 end
 function unzip(tuples)
   N = length(first(tuples))
   _unzip(tuples, Val(N))
 end
 
-# Reverse iteration order when ∇map is applied to vector,
-# needed for stateful functions.
-# See https://github.com/FluxML/Flux.jl/issues/1209
-# Should be generalized to abstract array, but reverse takes a dims keyword there
+# Reverse iteration order in ∇map, for stateful functions.
+# This is also used by comprehensions, which do guarantee iteration order.
+# Not done for pmap, presumably because all is lost if you are relying on its order.
 _tryreverse(m, backs, Δ) = backs, Δ
-function _tryreverse(m::typeof(map), backs, Δ::Union{AbstractVector, Tuple})
-  return reverse(backs), reverse(Δ)
-end
+_tryreverse(m::typeof(map), backs, Δ) = _reverse(backs), _reverse(Δ)
+
 _tryreverse(m, x) = x
-_tryreverse(m::typeof(map), x::Union{AbstractVector, Tuple}) = reverse(x)
+_tryreverse(m::typeof(map), x) = _reverse(x)
+
+# Fallback
+_reverse(x) = reverse(x)
+
+# Known cases in the standard library on which `reverse` errors (issue #1393)
+_reverse(x::LowerTriangular) = UpperTriangular(_reverse(parent(x)))
+_reverse(x::UpperTriangular) = LowerTriangular(_reverse(parent(x)))
+_reverse(x::UnitLowerTriangular) = UnitUpperTriangular(_reverse(parent(x)))
+_reverse(x::UnitUpperTriangular) = UnitLowerTriangular(_reverse(parent(x)))
+_reverse(x::Hermitian) = Hermitian(_reverse(x.data), x.uplo == 'U' ? :L : :U)
+_reverse(x::Symmetric) = Symmetric(_reverse(x.data), x.uplo == 'U' ? :L : :U)
+
+# With mismatched lengths, map stops early. With mismatched shapes, it makes a vector.
+# So we keep axes(x) to restore gradient dx to its full length & correct shape.
+_tryaxes(x) = (s = Base.IteratorSize(x); s isa Base.HasShape ? axes(x) : s isa Base.HasLength ? (Base.OneTo(length(x)),) : throw(ArgumentError("iterator size must be finite")))
+_tryaxes(x::AbstractArray) = axes(x)
+_tryaxes(x::Tuple) = Val(length(x))
+_tryaxes(x::Number) = x
+_restore(dx::AbstractArray{Nothing}, ax::Tuple) = similar(dx, ax)
+_restore(dx, ax::Tuple) = axes(dx) == ax ? dx : reshape(vcat(dx, falses(prod(map(length, ax)) - length(dx))), ax)
+_restore(dx, ::Val{N}) where {N} = ntuple(i -> get(dx,i,nothing), N)
+_restore(dx, ::Number) = only(dx)
+
+# Sometimes a pullback doesn't return a Tuple, but rather returns only a
+# single nothing to say "all arguments have zero cotangent". This function is needed to
+# account for that inside the pullback for map.
+last_or_nothing(::Nothing) = nothing
+last_or_nothing(x) = last(x)
 
 for (mapfunc,∇mapfunc) in [(:map,:∇map),(:pmap,:∇pmap)]
-  @eval function $∇mapfunc(cx, f, args...)
+  @eval function $∇mapfunc(cx, f::F, args::Vararg{Any, N}) where {F, N}
     ys_and_backs = $mapfunc((args...) -> _pullback(cx, f, args...), args...)
-    if isempty(ys_and_backs)
-      ys_and_backs, _ -> nothing
-    else
-      ys, backs = unzip(ys_and_backs)
-      ys, function (Δ)
+    ys = map(first, ys_and_backs)
+    arg_ax = map(_tryaxes, args)
+    function map_back(Δ)
+      if Base.issingletontype(F) && length(args) == 1
+        Δarg = $mapfunc(((_,pb), δ) -> last_or_nothing(pb(δ)), ys_and_backs, Δ) # No unzip needed
+        (nothing, Δarg)
+      elseif Base.issingletontype(F)
+        # Ensures `f` is pure: nothing captured & no state.
+        unzipped = _unzip($mapfunc(((_,pb), δ) -> tailmemaybe(pb(δ)), ys_and_backs, Δ), Val(N))
+        Δargs = map(_restore, unzipped, arg_ax)
+        (nothing, Δargs...)
+      else
         # Apply pullbacks in reverse order. Needed for correctness if `f` is stateful.
-        Δf_and_args_zipped = $mapfunc((f, δ) -> f(δ), _tryreverse($mapfunc, backs, Δ)...)
-        Δf_and_args = unzip(_tryreverse($mapfunc, Δf_and_args_zipped))
-        Δf = reduce(accum, Δf_and_args[1])
-        (Δf, Δf_and_args[2:end]...)
+        Δf_and_args_zipped = $mapfunc(((_,pb), δ) -> pb(δ), _tryreverse($mapfunc, ys_and_backs, Δ)...)
+        Δf_and_args = _unzip(_tryreverse($mapfunc, Δf_and_args_zipped), Val(N + 1))
+        Δf = unbuffer(reduce(accum!!, Δf_and_args[1]; init=nothing))
+        Δargs = map(_restore, Δf_and_args[2:end], arg_ax)
+        (Δf, Δargs...)
       end
     end
+    map_back(::Nothing) = nothing
+    return ys, map_back
   end
 
   @eval @adjoint function $mapfunc(f, args::Union{AbstractArray,Tuple}...)
     $∇mapfunc(__context__, f, args...)
   end
 end
+
+# The cotangents in a tuple stay deferred, as those of the third and later arguments of a
+# broadcast, which Base passes through `map(broadcastable, args)` (#1720).
+@_adjoint_keepthunks function map(f, args::Tuple...)
+  ys, back = ∇map(__context__, f, args...)
+  return ys, back ∘ _unthunk_whole
+end
+_unthunk_whole(Δ) = Δ
+_unthunk_whole(Δ::AbstractThunk) = unthunk_tangent(Δ)
 
 @adjoint function pmap(f, wp::AbstractWorkerPool, args...; kwargs...)
   ys_backs = pmap((x...) -> _pullback(__context__, f, x...), wp, args...; kwargs...)
@@ -228,179 +304,300 @@ end
   end
 end
 
-for t in subtypes(AbstractWorkerPool)
-  @nograd t
-end
-@nograd workers
-
 function _pullback(cx::AContext, ::typeof(collect), g::Base.Generator)
-  y, back = ∇map(cx, g.f, g.iter)
-  y, function (ȳ)
-    f̄, x̄ = back(ȳ)
+  giter, _keys = collect_if_dict(g.iter) # map is not defined for dictionaries
+  y, map_pullback = ∇map(cx, g.f, giter)
+
+  collect_pullback(::Nothing) = nothing
+
+  function collect_pullback(ȳ)
+    f̄, x̄ = map_pullback(ȳ)
+    x̄ = reconstruct_if_dict(x̄, _keys) # return a dictionary if needed
     (nothing, (f = f̄, iter = x̄),)
+  end
+  y, collect_pullback ∘ unthunk_tangent
+end
+
+collect_if_dict(x::Dict) = collect(x), collect(keys(x))
+collect_if_dict(x) = x, nothing
+
+reconstruct_if_dict(x̄, _keys::Nothing) = x̄
+
+function reconstruct_if_dict(x̄, _keys)
+  # This reverses `collect_if_dict`, which returns `_keys::Nothing` if x is not a Dict
+  @assert x̄ isa AbstractVector{<:Union{Nothing, NamedTuple{(:first,:second)}}}
+  # we don't compute gradients with respect to keys
+  # @assert all(x -> x === nothing || x[1] == 0 || x[1] === nothing, x̄)
+  d̄ = Dict(k => isnothing(x) ? nothing : x[2] for (x, k) in zip(x̄, _keys))
+  return d̄
+end
+
+@_adjoint_keepthunks iterate(r::UnitRange, i...) = iterate(r, i...), _ -> nothing
+
+# Iterators
+
+@adjoint function enumerate(xs)
+  back(::AbstractArray{Nothing}) = nothing
+  back(dy::NamedTuple{(:itr,)}) = tuple(dy.itr)
+  back(diys::AbstractArray{Union{Nothing, T}}) where T = (map(x -> x === nothing ? x : last(x), diys),)
+  back(diys) = (map(last, diys),)
+  enumerate(xs), back
+end
+
+function _pullback(cx::AContext, ::Type{<:Iterators.Filter}, f, x)
+  res, back = _pullback(cx, filter, f, collect(x))
+  return res, back ∘ unthunk_tangent
+end
+
+_ndims(::Base.HasShape{d}) where {d} = d
+_ndims(x) = Base.IteratorSize(x) isa Base.HasShape ? _ndims(Base.IteratorSize(x)) : 1
+
+function productfunc(xs, dy)
+  @assert length(first(dy)) == length(xs)
+  ndim = map(Zygote._ndims, xs)
+  cdim = cumsum((1, ndim[begin:end-1]...))
+  getters = ntuple(n -> StaticGetter{n}(), length(xs))
+  map(first(dy), xs, cdim, getters) do dyn, x, cd, getter
+    dyn === nothing && return nothing
+    nd = _ndims(x)
+    dims = nd == 0 ? (:) : ntuple(i -> i<cd ? i : i+nd, Val(ndims(dy)-nd))
+    init = map(zero, dyn) # allows for tuples, which accum can add:
+    red = mapreduce(getter, accum, dy; dims, init)
+    return _project(x, nd == 0 ? red : reshape(red, axes(x)))
   end
 end
 
-@adjoint iterate(r::UnitRange, i...) = iterate(r, i...), _ -> nothing
-
-@adjoint function sort(x::AbstractArray; by=identity)
-  p = sortperm(x, by=by)
-  return x[p], x̄ -> (x̄[invperm(p)],)
+@adjoint function Iterators.product(xs...)
+  product_pullback(::AbstractArray{Nothing}) = nothing
+  product_pullback(dy::NamedTuple{(:iterators,)}) = dy.iterators
+  product_pullback(dy::AbstractArray) = productfunc(xs, dy)
+  Iterators.product(xs...), product_pullback
 end
 
-@adjoint function filter(f, x::AbstractVector)
-    t = map(f, x)
-    x[t], Δ -> begin
-        dx = _zero(x, eltype(Δ))
-        dx[t] .= Δ
-        (nothing, dx)
-    end
+@adjoint function Base.collect(p::Base.Iterators.ProductIterator)
+  collect_product_pullback(dy) = ((iterators=productfunc(p.iterators, dy),),)
+  return collect(p), collect_product_pullback
+end
+
+function zipfunc(xs, dy)
+  getters = ntuple(n -> StaticGetter{n}(), length(xs))
+  map(xs, getters) do x, getter
+    dx = map(getter, dy)
+    _project(x, _restore(dx, _tryaxes(x)))
+  end
+end
+
+@adjoint function Iterators.zip(xs...)
+  zip_pullback(::AbstractArray{Nothing}) = nothing
+  zip_pullback(dy::NamedTuple{(:is,)}) = dy.is
+  zip_pullback(dy::AbstractArray) = zipfunc(xs, dy)
+  Iterators.zip(xs...), zip_pullback
+end
+
+@adjoint function Base.collect(z::Base.Iterators.Zip)
+  collect_zip_pullback(dy::AbstractArray) = ((is=zipfunc(z.is, dy),),)
+  collect(z), collect_zip_pullback
+end
+
+takefunc(itr, dy) = _restore(dy, _tryaxes(itr))
+
+@adjoint function Iterators.take(itr, n)
+  take_pullback(::AbstractArray{Nothing}) = nothing
+  take_pullback(dy::NamedTuple{(:xs,:n)}) = (dy.xs, dy.n)
+  take_pullback(dy::NamedTuple{(:n,:xs)}) = (dy.xs, dy.n)
+  take_pullback(dy::AbstractArray) = (takefunc(itr, dy), nothing)
+  Iterators.take(itr, n), take_pullback
+end
+
+@adjoint function Base.collect(t::Iterators.Take)
+    collect_take_pullback(dy) = ((xs=takefunc(t.xs, dy), n=nothing),)
+    collect(t), collect_take_pullback
 end
 
 # Reductions
-@adjoint function sum(xs::AbstractArray; dims = :)
-  if dims === (:)
-    sum(xs), Δ -> (Fill(Δ, size(xs)),)
-  else
-    sum(xs, dims = dims), Δ -> (similar(xs) .= Δ,)
-  end
-end
-
-@adjoint function sum(xs::AbstractArray{Bool}; dims = :)
-  sum(xs, dims = dims), Δ -> (nothing,)
-end
-
-_normalize_kws(kws::NamedTuple) = kws
-_normalize_kws(kws) = NamedTuple()
-
-function _pullback(cx::AContext, kwtype, kws, ::typeof(sum), f, xs::AbstractArray)
-  norm_kws = _normalize_kws(kws)
-  @assert !haskey(norm_kws, :init) # TODO add init support (julia 1.6)
-  y, back = pullback(cx, (f, xs) -> sum(f.(xs); norm_kws...), f, xs)
-  y, ȳ -> (nothing, nothing, nothing, back(ȳ)...)
-end
-
-@adjoint function sum(::typeof(abs2), X::AbstractArray; dims = :)
-  return sum(abs2, X; dims=dims), Δ::Union{Number, AbstractArray}->(nothing, ((2Δ) .* X))
-end
-
-@adjoint function prod(xs::AbstractArray; dims = :)
-  p = prod(xs; dims = dims)
-  p, Δ -> (p ./ xs .* Δ,)
-end
 
 function _pullback(cx::AContext, ::typeof(prod), f, xs::AbstractArray)
-  y, back = pullback(cx, ((f, xs) -> prod(f.(xs))), f, xs)
-  y, ȳ -> (nothing, back(ȳ)...)
+  return _pullback(cx, (f, xs) -> prod(f.(xs)), f, xs)
 end
 
-@adjoint function maximum(xs::AbstractArray; dims = :)
-  max, i = findmax(xs, dims = dims)
-  max, function (Δ)
-    Δ isa Real && abs(Δ) <= sqrt(eps(float(Δ))) && return nothing
-    Δ′ = zero(xs)
-    Δ′[i] = Δ
-    return (Δ′,)
+# `mapreduce`/`reduce` with `+` or `*` over an array, and `sum`/`prod`/`reduce` over a
+# generator of an array, are routed to `sum`/`prod`: the generic Base reduction would
+# otherwise be differentiated element by element, with a quadratic cost (#1691).
+# Other operators keep using the generic path.
+const ArrayOrGenerator = Union{AbstractArray, Base.Generator{<:AbstractArray}}
+
+for (op, red) in ((:+, :sum), (:*, :prod))
+  @eval begin
+    function _pullback(cx::AContext, ::typeof(mapreduce), f, ::typeof($op), xs::AbstractArray)
+      isempty(xs) && return mapreduce(f, $op, xs), _ -> (nothing, nothing, nothing, zero.(xs))
+      y, back = _pullback(cx, $red, f, xs)
+      mapreduce_pullback(Δ) = (b = back(Δ); b === nothing ? nothing : (nothing, b[2], nothing, b[3]))
+      return y, mapreduce_pullback
+    end
+
+    function _pullback(cx::AContext, ::typeof(mapreduce), f, ::typeof($op), g::Base.Generator{<:AbstractArray})
+      isempty(g.iter) && return mapreduce(f, $op, g), _ -> (nothing, nothing, nothing, (f = nothing, iter = zero.(g.iter)))
+      gf = g.f
+      fg = x -> f(gf(x))
+      y, back = _pullback(cx, mapreduce, fg, $op, g.iter)
+      function mapreduce_generator_pullback(Δ)
+        b = back(Δ)
+        b === nothing && return nothing
+        Δfg = b[2]  # tangent of the closure `fg`, with fields `f` and `gf`
+        (nothing, Δfg === nothing ? nothing : Δfg.f, nothing,
+         (f = Δfg === nothing ? nothing : Δfg.gf, iter = b[4]))
+      end
+      return y, mapreduce_generator_pullback
+    end
+
+    function _pullback(cx::AContext, ::typeof(reduce), ::typeof($op), xs::ArrayOrGenerator)
+      y, back = _pullback(cx, $red, xs)
+      reduce_pullback(Δ) = (b = back(Δ); b === nothing ? nothing : (nothing, nothing, b[2]))
+      return y, reduce_pullback
+    end
+
+    function _pullback(cx::AContext, ::typeof($red), g::Base.Generator{<:AbstractArray})
+      isempty(g.iter) && return $red(g), _ -> nothing
+      y, back = _pullback(cx, $red, g.f, g.iter)
+      generator_pullback(Δ) = (b = back(Δ); b === nothing ? nothing : (nothing, (f = b[2], iter = b[3])))
+      return y, generator_pullback
+    end
   end
 end
 
-@adjoint function minimum(xs::AbstractArray; dims = :)
-  min, i = findmin(xs, dims = dims)
-  min, function (Δ)
-    Δ′ = zero(xs)
-    Δ′[i] = Δ
-    return (Δ′,)
+# Keyword arguments: `init` is applied once on top of the `dims` reduction.
+_reduce_dims(f, ::typeof(+), xs, dims) = sum(f, xs; dims)
+_reduce_dims(::typeof(identity), ::typeof(+), xs, dims) = sum(xs; dims)
+_reduce_dims(f, ::typeof(*), xs, dims) = prod(f.(xs); dims)
+_reduce_dims(::typeof(identity), ::typeof(*), xs, dims) = prod(xs; dims)
+
+function _mapreduce_init(f, op, xs; dims=:, init=nothing)
+  y = _reduce_dims(f, op, xs, dims)
+  init === nothing && return y
+  dims isa Colon ? op(init, y) : map(yi -> op(init, yi), y)
+end
+
+_mapreduce_kw(kws, f, op, xs) = _mapreduce_init(f, op, xs; kws...)
+
+# For an empty array the result is `init` (or Base's error), and `f` is never called.
+_empty_kw_tangent(kws, Δ) =
+  haskey(kws, :init) && Δ !== nothing ? merge(map(_ -> nothing, kws), (init = sum(Δ),)) : nothing
+
+function _pullback(cx::AContext, ::Core.kwftype(typeof(mapreduce)), kws::NamedTuple,
+                   ::typeof(mapreduce), f, op::Union{typeof(+), typeof(*)}, xs::AbstractArray)
+  isempty(xs) && return mapreduce(f, op, xs; kws...),
+                        Δ -> (nothing, _empty_kw_tangent(kws, Δ), nothing, nothing, nothing, zero.(xs))
+  y, back = _pullback(cx, _mapreduce_kw, kws, f, op, xs)
+  mapreduce_kw_pullback(Δ) = (b = back(Δ); b === nothing ? nothing : (nothing, b[2], nothing, b[3], nothing, b[5]))
+  return y, mapreduce_kw_pullback
+end
+
+# The ChainRules rules for `foldl` and `accumulate` work out the cotangent of `init`, but
+# cannot return it, as an `rrule` has no slot for keywords (ChainRules.jl#567, #1684).
+# These run the same algorithm, keeping each step's pullback to call them in reverse order.
+
+_vec_or_tuple(xs::AbstractArray) = vec(xs)
+_vec_or_tuple(xs::Tuple) = xs
+
+_reshape_as(ys, xs::AbstractArray) = reshape(ys, axes(xs))
+_reshape_as(ys, ::Tuple) = ys
+
+_lazy_reverse(xs) = Iterators.reverse(xs)
+_lazy_reverse(xs::Tuple) = reverse(xs)
+
+_zip2(xs, ys) = zip(xs, ys)
+_zip2(xs::Tuple, ys::Tuple) = map(tuple, xs, ys)
+
+_nothing3(::Nothing) = (nothing, nothing, nothing)
+_nothing3(Δs::Tuple) = Δs
+
+function _scan_pullbacks(cx, op::F, init, xs) where {F}
+  accumulate(_vec_or_tuple(xs); init = (init, nothing)) do (acc, _), x
+    _pullback(cx, op, acc, x)
   end
 end
 
-@adjoint function dropdims(xs::AbstractArray; dims)
-  dropdims(xs, dims = dims), Δ -> (reshape(Δ, size(xs)...),)
+# `Δacc` is the cotangent of the last result, `Δys` those of all of them (or `nothing`).
+function _scan_back(xs, steps, Δacc, Δys)
+  isempty(steps) && return nothing, Δacc, nothing
+  rsteps = _lazy_reverse(steps)
+  rΔys = Δys === nothing ? map(_ -> nothing, rsteps) : _lazy_reverse(_vec_or_tuple(Δys))
+  rΔs = accumulate(_zip2(rsteps, rΔys); init = (nothing, Δacc, nothing)) do (_, δacc, _), ((_, back), δy)
+    _nothing3(back(accum(δacc, δy)))
+  end
+  Δop = reduce(accum, map(first, rΔs); init = nothing)
+  Δxs = _project(xs, _reshape_as(map(last, _lazy_reverse(rΔs)), xs))
+  return Δop, last(rΔs)[2], Δxs
+end
+
+function _pullback(cx::AContext, ::Core.kwftype(typeof(foldl)), kws::NamedTuple{(:init,)},
+                   ::typeof(foldl), op::F, xs::Union{AbstractArray, Tuple}) where {F}
+  steps = _scan_pullbacks(cx, op, kws.init, xs)
+  function foldl_kw_pullback(Δ)
+    Δop, Δinit, Δxs = _scan_back(xs, steps, unthunk_tangent(Δ), nothing)
+    return (nothing, (init = Δinit,), nothing, Δop, Δxs)
+  end
+  foldl_kw_pullback(::Nothing) = nothing
+  return isempty(steps) ? kws.init : first(last(steps)), foldl_kw_pullback
+end
+
+function _pullback(cx::AContext, ::Core.kwftype(typeof(accumulate)),
+                   kws::Union{NamedTuple{(:init,)}, NamedTuple{(:dims,)}, NamedTuple{(:dims, :init)}, NamedTuple{(:init, :dims)}},
+                   ::typeof(accumulate), op::F, xs::Union{AbstractArray, Tuple}) where {F}
+  kw = haskey(kws, :init) ? (init = kws.init,) : NamedTuple()
+  y, back = _accumulate_pullback(cx, op, xs, get(kws, :dims, nothing), kw)
+  function accumulate_kw_pullback(Δ)
+    Δop, Δxs, Δkw = back(unthunk_tangent(Δ))
+    return (nothing, Δkw === nothing ? nothing : merge(map(_ -> nothing, kws), Δkw), nothing, Δop, Δxs)
+  end
+  accumulate_kw_pullback(::Nothing) = nothing
+  return y, accumulate_kw_pullback
+end
+
+# Each method returns `y` and a pullback giving the cotangents of `op`, `xs` and `kw`.
+_accumulate_pullback(cx, op, xs::Tuple, ::Nothing, kw::NamedTuple{(:init,)}) = _accumulate_scan(cx, op, xs, kw.init)
+
+function _accumulate_pullback(cx, op::F, xs::AbstractArray, dims, kw) where {F}
+  if dims === nothing || (dims == 1 && xs isa AbstractVector)
+    isempty(kw) || return _accumulate_scan(cx, op, xs, kw.init)
+    y, back = _pullback(cx, accumulate, op, xs)
+    return y, Δ -> (b = back(Δ); b === nothing ? (nothing, nothing, nothing) : (b[2], b[3], nothing))
+  elseif dims > ndims(xs) || isempty(xs)  # beyond `ndims`, Base copies `xs` and ignores `init`
+    return accumulate(op, xs; dims, kw...), Δ -> (nothing, Δ, nothing)
+  end
+  perm = ntuple(i -> i == 1 ? dims : i <= dims ? i - 1 : i, ndims(xs))
+  y, back = _pullback(cx, _accumulate_dims, op, xs, perm, kw)
+  return y, Δ -> (b = back(Δ); b === nothing ? (nothing, nothing, nothing) : (b[2], b[3], b[5]))
+end
+
+function _accumulate_scan(cx, op::F, xs, init) where {F}
+  steps = _scan_pullbacks(cx, op, init, xs)
+  function accumulate_scan_back(Δ)
+    Δop, Δinit, Δxs = _scan_back(xs, steps, nothing, Δ)
+    return Δop, Δxs, (init = Δinit,)
+  end
+  return _reshape_as(map(first, steps), xs), accumulate_scan_back
+end
+
+# The ChainRules rule has no `dims`. This scans the columns, with `dims` moved first.
+function _accumulate_dims(op, xs, perm, kw)
+  xp = permutedims(xs, perm)
+  ys = stack(map(col -> accumulate(op, col; kw...), eachcol(reshape(xp, size(xp, 1), :))))
+  return permutedims(reshape(ys, size(xp)), invperm(perm))
 end
 
 @adjoint real(x::AbstractArray) = real(x), r̄ -> (real(r̄),)
 @adjoint conj(x::AbstractArray) = conj(x), r̄ -> (conj(r̄),)
 @adjoint imag(x::AbstractArray) = imag(x), ī -> (complex.(0, real.(ī)),)
 
-@adjoint function mean(xs::AbstractArray; dims = :)
-  return mean(xs, dims=dims), Δ -> (_backmean(xs,Δ,dims),)
-end
-_backmean(xs, Δ, ::Colon) = zero(xs) .+ Δ ./ length(xs)
-_backmean(xs, Δ, dims) = zero(xs) .+ Δ ./ mapreduce(i -> size(xs,i),*,dims)
-
-@adjoint function Statistics.var(xs::AbstractArray; corrected::Bool=true, dims=:, mean=mean(xs, dims=dims))
-    return Statistics.var(xs; corrected=corrected, mean=mean, dims=dims), Δ -> _backvar(xs, Δ, corrected, mean, dims)
-end
-_backvar(xs, Δ, corrected::Bool, mean, dims)         = _backvar(xs, Δ, mapreduce(i -> size(xs,i),*,dims) - corrected, mean)
-_backvar(xs, Δ, corrected::Bool, mean, ::Colon)      = _backvar(xs, Δ, length(xs) - corrected, mean)
-_backvar(xs, Δ, N::Int, mean) = (convert(eltype(xs), 2/N) .* Δ .* (xs .- mean),)
-
-@adjoint function Statistics.std(xs::AbstractArray; corrected::Bool=true, dims=:, mean=mean(xs, dims=dims))
-    s = Statistics.std(xs; corrected=corrected, mean=mean, dims=dims)
-    return s, Δ -> _backvar(xs, Δ ./ (2 .* s), corrected, mean, dims)
-end
-
-@adjoint function cumsum(xs::AbstractVector; dims::Integer = 1)
-  dims == 1 || return copy(xs), Δ -> (Δ,)
-  cumsum(xs), Δ -> (reverse(cumsum(reverse(Δ))),)
-end
-@adjoint function cumsum(xs::AbstractArray; dims::Integer)
-  dims <= ndims(xs) || return copy(xs), Δ -> (Δ,)
-  cumsum(xs; dims=dims), Δ -> begin
-    (reverse(cumsum(reverse(Δ, dims=dims), dims=dims), dims=dims),)
-  end
-end
-
-@adjoint eachrow(x::AbstractVecOrMat) = collect(eachrow(x)), dys -> ∇eachslice(dys, x, 1)
-@adjoint eachcol(x::AbstractVecOrMat) = collect(eachcol(x)), dys -> ∇eachslice(dys, x, 2)
-@adjoint eachslice(x::AbstractArray; dims::Integer) =
-  collect(eachslice(x; dims=dims)), dys -> ∇eachslice(dys, x, dims)
-
-function ∇eachslice(dys, x::AbstractArray, dim::Integer) where {TX}
-  i1 = findfirst(dy -> dy isa AbstractArray, dys)
-  i1 === nothing && return (zero(x),) # all slices get nothing
-  T = promote_type(eltype(dys[i1]), eltype(x))
-  dx = similar(x, T)
-  for i in axes(x, dim)
-    if dys[i] isa AbstractArray
-      copyto!(selectdim(dx,dim,i), dys[i])
-    else
-      selectdim(dx,dim,i) .= 0
-    end
-  end
-  (dx,)
-end
-
 
 # LinearAlgebra
 # =============
 
-@adjoint function transpose(x)
-  back(Δ) = (transpose(Δ),)
-  back(Δ::NamedTuple{(:parent,)}) = (Δ.parent,)
-  return transpose(x), back
-end
-
-@adjoint function LinearAlgebra.Transpose(x)
-  back(Δ) = (LinearAlgebra.Transpose(Δ),)
-  back(Δ::NamedTuple{(:parent,)}) = (Δ.parent,)
-  return LinearAlgebra.Transpose(x), back
-end
-
-
-@adjoint function Base.adjoint(x)
-  back(Δ) = (Δ',)
-  back(Δ::NamedTuple{(:parent,)}) = (Δ.parent,)
-  return x', back
-end
-
-@adjoint function LinearAlgebra.Adjoint(x)
-  back(Δ) = (LinearAlgebra.Adjoint(Δ),)
-  back(Δ::NamedTuple{(:parent,)}) = (Δ.parent,)
-  return LinearAlgebra.Adjoint(x), back
-end
-
 @adjoint parent(x::LinearAlgebra.Adjoint) = parent(x), ȳ -> (LinearAlgebra.Adjoint(ȳ),)
 @adjoint parent(x::LinearAlgebra.Transpose) = parent(x), ȳ -> (LinearAlgebra.Transpose(ȳ),)
+@adjoint parent(x::LinearAlgebra.UpperTriangular) = parent(x), ȳ -> (LinearAlgebra.UpperTriangular(ȳ),)
+@adjoint parent(x::LinearAlgebra.LowerTriangular) = parent(x), ȳ -> (LinearAlgebra.LowerTriangular(ȳ),)
 
 function _kron(mat1::AbstractMatrix,mat2::AbstractMatrix)
     m1, n1 = size(mat1)
@@ -411,12 +608,16 @@ function _kron(mat1::AbstractMatrix,mat2::AbstractMatrix)
 
     return reshape(mat1_rsh.*mat2_rsh, (m1*m2,n1*n2))
 end
+_kron(a::AbstractVector, b::AbstractVector) = vec(_kron(reshape(a, :, 1), reshape(b, :, 1)))
+_kron(a::AbstractVector, b::AbstractMatrix) = _kron(reshape(a, :, 1), b)
+_kron(a::AbstractMatrix, b::AbstractVector) = _kron(a, reshape(b, :, 1))
 
-@adjoint kron(a::AbstractMatrix, b::AbstractMatrix) = pullback(_kron, a, b)
+function _pullback(cx::AContext, ::typeof(kron), a::AbstractVecOrMat, b::AbstractVecOrMat)
+  res, back = _pullback(cx, _kron, a, b)
+  return res, back ∘ unthunk_tangent
+end
 
-@adjoint logabsdet(xs::AbstractMatrix) = logabsdet(xs), Δ -> (Δ[1] * inv(xs)',)
-
-@adjoint function inv(A::Union{Number, AbstractMatrix})
+@adjoint function inv(A::AbstractMatrix)
   Ainv = inv(A)
   return Ainv, function (Δ)
     ∇A = - Ainv' * Δ * Ainv'
@@ -435,13 +636,23 @@ end
   rtol::Real = (eps(real(float(one(T))))*min(size(A)...))*iszero(atol),
 ) where {T}
   Y = pinv(A)
-  return Y, Δ->(-Y' * Δ * Y' + (I - A * Y) * Δ' * Y * Y' + Y' * Y * Δ' * (I - Y * A),)
+  return Y, Δ->(_pinv_back(A, Y, Δ),)
+end
+
+# Associated so that the intermediates are at most `min(size(A)...)` square,
+# rather than `max(size(A)...)` square.
+function _pinv_back(A, Y, Δ)
+  if size(A, 1) >= size(A, 2)
+    -(Y' * (Δ * Y')) + (Δ' - A * (Y * Δ')) * (Y * Y') + Y' * ((Y * Δ') * (I - Y * A))
+  else
+    Z = (Y' * Y) * Δ'
+    -((Y' * Δ) * Y') + (((I - A * Y) * Δ') * Y) * Y' + (Z - (Z * Y) * A)
+  end
 end
 
 # When `A` is guaranteed to be square, definitely use the simple expression for the adjoint.
 @adjoint function \(
   A::Union{
-    Diagonal,
     AbstractTriangular,
     LinearAlgebra.Adjoint{<:Any, <:AbstractTriangular},
     Transpose{<:Any, <:AbstractTriangular},
@@ -455,7 +666,16 @@ end
   end
 end
 
-@adjoint function /(A::AbstractMatrix, B::Union{Diagonal, AbstractTriangular})
+# Only the diagonal of the dense gradient `-B̄ * Y'` is needed, which avoids an n×n matrix.
+@adjoint function \(A::Diagonal, B::AbstractVecOrMat)
+  Y = A \ B
+  return Y, function(Ȳ)
+    B̄ = A' \ Ȳ
+    return (Diagonal(-vec(sum(B̄ .* conj.(Y); dims=2))), B̄)
+  end
+end
+
+@adjoint function /(A::AbstractMatrix, B::AbstractTriangular)
   Y = A / B
   return Y, function(Ȳ)
     Ā = Ȳ / B'
@@ -463,19 +683,88 @@ end
   end
 end
 
+@adjoint function /(A::AbstractMatrix, B::Diagonal)
+  Y = A / B
+  return Y, function(Ȳ)
+    Ā = Ȳ / B'
+    return (Ā, Diagonal(-vec(sum(conj.(Y) .* Ā; dims=1))))
+  end
+end
+
 @adjoint function \(A::AbstractMatrix, B::AbstractVecOrMat)
   Z = A \ B
-  return Z, function(Z̄)
-    B̄ = A' \ Z̄
-    if size(A, 1) == size(A, 2)
-      return (-B̄ * Z', B̄)
-    else
-      a = -B̄ * Z'
-      b = (B - A * Z) * B̄' / A'
-      c = A' \ Z * (Z̄' - B̄' * A)
-      return (a + b + c, B̄)
-    end
+  return Z, Z̄ -> _ldiv_back(A, B, Z, Z̄)
+end
+
+function _ldiv_back(A, B, Z, Z̄)
+  B̄ = A' \ Z̄
+  if size(A, 1) == size(A, 2)
+    return (-B̄ * Z', B̄)
+  else
+    a = -B̄ * Z'
+    b = (B - A * Z) * B̄' / A'
+    c = A' \ Z * (Z̄' - B̄' * A)
+    return (a + b + c, B̄)
   end
+end
+
+# Dense CPU `A`: reuse the factorization that `A \ B` itself computes (`lu` if square and not
+# triangular, pivoted `qr` otherwise), so the pullback does not refactorize `A`.
+# Other types may solve differently, so they keep using the generic method.
+@adjoint function \(A::Matrix{<:BlasFloat}, B::AbstractVecOrMat)
+  F, Z = _ldiv_factorize(A, B)
+  return Z, Z̄ -> _ldiv_back(F, A, B, Z, Z̄)
+end
+
+# Wrapped so that the pullback has a single type, whichever factorization is used.
+struct _LdivFactor
+  F::Union{Nothing,LU,QRPivoted}
+end
+
+function _ldiv_factorize(A, B)
+  F = if size(A, 1) != size(A, 2)
+    qr(A, ColumnNorm())
+  elseif istril(A) || istriu(A)  # solved as triangular
+    nothing
+  else
+    lu(A)
+  end
+  return _LdivFactor(F), F === nothing ? A \ B : F \ B
+end
+
+_ldiv_back(F::_LdivFactor, A, B, Z, Z̄) = _ldiv_back(F.F, A, B, Z, Z̄)
+
+_ldiv_back(::Nothing, A, B, Z, Z̄) = _ldiv_back(A, B, Z, Z̄)
+
+function _ldiv_back(F::LU, A, B, Z, Z̄)
+  B̄ = F' \ Z̄
+  return (-B̄ * Z', B̄)
+end
+
+# Same as the generic rectangular case, but reassociated so that no m×m matrix is formed:
+# `(B - A * Z) * B̄' / A'` equals `(B - A * Z) * (A \ B̄)'`.
+function _ldiv_back(F::QRPivoted, A, B, Z, Z̄)
+  Fᴴ = qr(A', ColumnNorm())
+  W = Fᴴ \ hcat(Z̄, Z)  # a single solve, since each one is costly when `A` is tall
+  k = size(Z̄, 2)
+  B̄ = reshape(W[:, 1:k], size(B))
+  X = reshape(W[:, k+1:end], size(B))  # A' \ Z
+  a = -B̄ * Z'
+  b = (B - A * Z) * (F \ B̄)'
+  c = X * (Z̄' - B̄' * A)
+  return (a + b + c, B̄)
+end
+
+# Nested AD cannot differentiate the LAPACK calls on the cached factorization,
+# so it goes through the generic formulas instead.
+@adjoint function _ldiv_factorize(A, B)
+  F, Z = _ldiv_factorize(A, B)
+  return (F, Z), Δ -> _ldiv_back(A, B, Z, Δ[2])
+end
+
+@adjoint function _ldiv_back(F, A, B, Z, Z̄)
+  y, back = _pullback(__context__, _ldiv_back, A, B, Z, Z̄)
+  return y, Δ -> (nothing, Base.tail(back(Δ))...)
 end
 
 # LinAlg Matrix Types
@@ -486,18 +775,9 @@ end
 @adjoint LinearAlgebra.UnitLowerTriangular(A) = UnitLowerTriangular(A), Δ->(UnitLowerTriangular(Δ)-I,)
 @adjoint LinearAlgebra.UnitUpperTriangular(A) = UnitUpperTriangular(A), Δ->(UnitUpperTriangular(Δ)-I,)
 
-# This is basically a hack while we don't have a working `ldiv!`.
-@adjoint function \(A::Cholesky, B::AbstractVecOrMat)
-  Y, back = Zygote.pullback((U, B)->U \ (U' \ B), A.U, B)
-  return Y, function(Ȳ)
-    Ā_factors, B̄ = back(Ȳ)
-    return ((uplo=nothing, info=nothing, factors=Ā_factors), B̄)
-  end
-end
-
 function _symmetric_back(Δ, uplo)
   L, U, D = LowerTriangular(Δ), UpperTriangular(Δ), Diagonal(Δ)
-  return uplo == 'U' ? U .+ transpose(L) - D : L .+ transpose(U) - D
+  return uplo == 'U' ? U .+ transpose(L) .- D : L .+ transpose(U) .- D
 end
 _symmetric_back(Δ::Diagonal, uplo) = Δ
 _symmetric_back(Δ::UpperTriangular, uplo) = collect(uplo == 'U' ? Δ : transpose(Δ))
@@ -538,35 +818,6 @@ end
   Δ -> (nothing, convert(S, Δ),)
 @adjoint Matrix(A::LinearAlgebra.HermOrSym{T,S}) where {T,S} = Matrix(A),
   Δ -> (convert(S, Δ),)
-
-@adjoint function cholesky(Σ::Real)
-  C = cholesky(Σ)
-  return C, Δ::NamedTuple->(Δ.factors[1, 1] / (2 * C.U[1, 1]),)
-end
-
-@adjoint function cholesky(Σ::Diagonal; check = true)
-  C = cholesky(Σ, check = check)
-  return C, Δ::NamedTuple -> begin
-    issuccess(C) || throw(PosDefException(C.info))
-    return Diagonal(diag(Δ.factors) .* inv.(2 .* C.factors.diag)), nothing
-  end
-end
-
-# Implementation due to Seeger, Matthias, et al. "Auto-differentiating linear algebra."
-@adjoint function cholesky(Σ::Union{StridedMatrix, Symmetric{<:Real, <:StridedMatrix}}; check = true)
-  C = cholesky(Σ, check = check)
-  return C, function(Δ::NamedTuple)
-    issuccess(C) || throw(PosDefException(C.info))
-    U, Ū = C.U, Δ.factors
-    Σ̄ = similar(U.data)
-    Σ̄ = mul!(Σ̄, Ū, U')
-    Σ̄ = copytri!(Σ̄, 'U')
-    Σ̄ = ldiv!(U, Σ̄)
-    Σ̄ = BLAS.trsm!('R', 'U', 'T', 'N', one(eltype(Σ)), U.data, Σ̄)
-    Σ̄[diagind(Σ̄)] ./= 2
-    return (UpperTriangular(Σ̄),)
-  end
-end
 
 @adjoint function lyap(A::AbstractMatrix, C::AbstractMatrix)
   X = lyap(A, C)
@@ -655,14 +906,14 @@ _hermsympow(A::Hermitian, p::Integer) = A^p
 
 @adjoint function _hermsympow(A::Hermitian, p::Integer)
   if p < 0
-    B, back = Zygote.pullback(A->Base.power_by_squaring(inv(A), -p), A)
+    B, back = _pullback(__context__, A -> Base.power_by_squaring(inv(A), -p), A)
   else
-    B, back = Zygote.pullback(A->Base.power_by_squaring(A, p), A)
+    B, back = _pullback(__context__, A -> Base.power_by_squaring(A, p), A)
   end
   Ω = Hermitian(_realifydiag!(B))
   return Ω, function (Ω̄)
     B̄ = _hermitian_back(Ω̄, 'U')
-    Ā = back(B̄)[1]
+    Ā = last(back(B̄))
     return (Ā, nothing)
   end
 end
@@ -684,7 +935,7 @@ end
 # ChainRules has this also but does not use FillArrays, so we have our own definition
 # for improved performance. See https://github.com/JuliaDiff/ChainRules.jl/issues/46
 Zygote.@adjoint function LinearAlgebra.tr(x::AbstractMatrix)
-  # x is a squre matrix checked by tr,
+  # x is a square matrix checked by tr,
   # so we could just use Eye(size(x, 1))
   # to create a Diagonal
   tr(x), function (Δ::Number)
@@ -703,6 +954,11 @@ end
     return ((uplo=nothing, info=nothing, factors=nothing),)
   end
 end
+@adjoint function literal_getproperty(C::Cholesky, ::Val{:factors})
+  return literal_getproperty(C, Val(:factors)), function(Δ)
+    return ((uplo=nothing, info=nothing, factors=Δ),)
+  end
+end
 @adjoint function literal_getproperty(C::Cholesky, ::Val{:U})
   return literal_getproperty(C, Val(:U)), function(Δ)
     Δ_factors = C.uplo == 'U' ? UpperTriangular(Δ) : LowerTriangular(copy(Δ'))
@@ -713,12 +969,6 @@ end
   return literal_getproperty(C, Val(:L)), function(Δ)
     Δ_factors = C.uplo == 'L' ? LowerTriangular(Δ) : UpperTriangular(copy(Δ'))
     return ((uplo=nothing, info=nothing, factors=Δ_factors),)
-  end
-end
-
-@adjoint function logdet(C::Cholesky)
-  return logdet(C), function(Δ)
-    return ((uplo=nothing, info=nothing, factors=Diagonal(2 .* Δ ./ diag(C.factors))),)
   end
 end
 
@@ -758,151 +1008,54 @@ AbstractFFTs.rfft(x::Fill, dims...) = AbstractFFTs.rfft(collect(x), dims...)
 AbstractFFTs.irfft(x::Fill, d, dims...) = AbstractFFTs.irfft(collect(x), d, dims...)
 AbstractFFTs.brfft(x::Fill, d, dims...) = AbstractFFTs.brfft(collect(x), d, dims...)
 
-# the adjoint jacobian of an FFT with respect to its input is the reverse FFT of the
-# gradient of its inputs, but with different normalization factor
-@adjoint function fft(xs)
-  return AbstractFFTs.fft(xs), function(Δ)
-    return (AbstractFFTs.bfft(Δ),)
-  end
-end
-
-@adjoint function *(P::AbstractFFTs.Plan, xs)
-  return P * xs, function(Δ)
-    N = prod(size(xs)[[P.region...]])
-    return (nothing, N * (P \ Δ))
-  end
-end
-
+# The adjoint Jacobian of applying a plan to its input is the *adjoint* plan applied
+# to the cotangent. The old `N * (P \ Δ)` formula assumed `P' == N * inv(P)`, which only
+# holds for plans that are unitary up to the scaling `N`; it gave a gradient off by a
+# constant factor for e.g. the orthonormal DCT or `rfft` (see #899).
+#
+# For `*`, AbstractFFTs already ships a correct (and `ProjectTo`-aware, hence type
+# stable) `rrule`, so we let ChainRules handle it rather than defining an adjoint here.
+# AbstractFFTs has no rule for `\`, so we provide one using the adjoint plan `P'`.
 @adjoint function \(P::AbstractFFTs.Plan, xs)
-  return P \ xs, function(Δ)
-    N = prod(size(Δ)[[P.region...]])
-    return (nothing, (P * Δ)/N)
-  end
-end
-
-# all of the plans normalize their inverse, while we need the unnormalized one.
-@adjoint function ifft(xs)
-  return AbstractFFTs.ifft(xs), function(Δ)
-    N = length(xs)
-    return (AbstractFFTs.fft(Δ)/N,)
-  end
-end
-
-@adjoint function bfft(xs)
-  return AbstractFFTs.bfft(xs), function(Δ)
-    return (AbstractFFTs.fft(Δ),)
-  end
-end
-
-@adjoint function fftshift(x)
-    return fftshift(x), function(Δ)
-        return (ifftshift(Δ),)
-    end
-end
-
-@adjoint function ifftshift(x)
-    return ifftshift(x), function(Δ)
-        return (fftshift(Δ),)
-    end
-end
-
-
-# to actually use rfft, one needs to insure that everything
-# that happens in the Fourier domain could've been done in
-# the space domain with real numbers. This means enforcing
-# conjugate symmetry along all transformed dimensions besides
-# the first. Otherwise this is going to result in *very* weird
-# behavior.
-@adjoint function rfft(xs::AbstractArray{<:Real})
-  return AbstractFFTs.rfft(xs), function(Δ)
-    N = length(Δ)
-    originalSize = size(xs,1)
-    return (AbstractFFTs.brfft(Δ, originalSize),)
-  end
-end
-
-@adjoint function irfft(xs, d)
-  return AbstractFFTs.irfft(xs, d), function(Δ)
-    total = length(Δ)
-    fullTransform = AbstractFFTs.rfft(real.(Δ))/total
-    return (fullTransform, nothing)
-  end
-end
-
-@adjoint function brfft(xs, d)
-  return AbstractFFTs.brfft(xs, d), function(Δ)
-    fullTransform = AbstractFFTs.rfft(real.(Δ))
-    return (fullTransform, nothing)
-  end
-end
-
-
-# if we're specifying the dimensions
-@adjoint function fft(xs, dims)
-  return AbstractFFTs.fft(xs, dims), function(Δ)
-    # dims can be int, array or tuple,
-    # convert to collection for use as index
-    dims = collect(dims)
-    return (AbstractFFTs.bfft(Δ, dims), nothing)
-  end
-end
-
-@adjoint function bfft(xs, dims)
-  return AbstractFFTs.ifft(xs, dims), function(Δ)
-    dims = collect(dims)
-    return (AbstractFFTs.fft(Δ, dims),nothing)
-  end
-end
-
-@adjoint function ifft(xs, dims)
-  return AbstractFFTs.ifft(xs, dims), function(Δ)
-    dims = collect(dims)
-    N = prod(collect(size(xs))[dims])
-    return (AbstractFFTs.fft(Δ, dims)/N,nothing)
-  end
-end
-
-@adjoint function rfft(xs, dims)
-  return AbstractFFTs.rfft(xs, dims), function(Δ)
-    dims = collect(dims)
-    N = prod(collect(size(xs))[dims])
-    return (N * AbstractFFTs.irfft(Δ, size(xs,dims[1]), dims), nothing)
-  end
-end
-
-@adjoint function irfft(xs, d, dims)
-  return AbstractFFTs.irfft(xs, d, dims), function(Δ)
-    dims = collect(dims)
-    N = prod(collect(size(xs))[dims])
-    return (AbstractFFTs.rfft(real.(Δ), dims)/N, nothing, nothing)
-  end
-end
-@adjoint function brfft(xs, d, dims)
-  return AbstractFFTs.brfft(xs, d, dims), function(Δ)
-    dims = collect(dims)
-    return (AbstractFFTs.rfft(real.(Δ), dims), nothing, nothing)
-  end
-end
-
-
-@adjoint function fftshift(x, dims)
-    return fftshift(x), function(Δ)
-        return (ifftshift(Δ, dims), nothing)
-    end
-end
-
-@adjoint function ifftshift(x, dims)
-    return ifftshift(x), function(Δ)
-        return (fftshift(Δ, dims), nothing)
-    end
+  return P \ xs, Δ -> (nothing, ProjectTo(xs)(P' \ Δ))
 end
 
 # FillArray functionality
 # =======================
 
-@adjoint function broadcasted(op, r::AbstractFill{<:Real})
-  y, _back = Zygote.pullback(op, getindex_value(r))
-  back(Δ::AbstractFill) = (nothing, Fill(_back(getindex_value(Δ))[1], size(r)))
-  back(Δ::AbstractArray) = (nothing, getindex.(_back.(Δ), 1))
+@adjoint broadcasted(op, r::AbstractFill{<:Real}) = _broadcast_fill(__context__, op, r)
+
+function _broadcast_fill(cx, op, r)
+  y, _back = _pullback(cx, op, getindex_value(r))
+  back(Δ::AbstractFill) = (nothing, Fill(last(_back(getindex_value(Δ))), size(r)))
+  back(Δ::AbstractArray) = (nothing, last.(_back.(Δ)))
   return Fill(y, size(r)), back
 end
+
+# `sort` is a pure permutation of its input, so its pullback scatters the
+# cotangent back through the sorting permutation. Computing it via `sortperm`
+# (rather than differentiating the sort algorithm) keeps this GPU-friendly and
+# adds support for the `dims` keyword, which ChainRules' 1-D `sort` rrule lacks.
+# See #1499 (`sum(sort(x; dims=1))` on a CuArray previously errored).
+@adjoint function sort(x::AbstractArray; kws...)
+  p = sortperm(x; kws...)
+  function sort_pullback(ȳ)
+    x̄ = zero(ȳ)
+    x̄[p] = ȳ
+    return (x̄,)
+  end
+  return x[p], sort_pullback
+end
+
+# Sorted search
+# =============
+
+# `searchsorted*` return integer indices (or an index range) locating a value in a
+# sorted array — piecewise-constant, integer-valued outputs whose derivative is zero.
+# Their binary search computes a midpoint with the `>>>` (`lshr_int`) intrinsic, so
+# without these the source transform recurses into a non-differentiable intrinsic and
+# errors whenever the searched array is itself differentiable (e.g.
+# `searchsortedlast.(eachcol(s), x)`). See #1156.
+ChainRulesCore.@non_differentiable searchsortedfirst(::Any, ::Any)
+ChainRulesCore.@non_differentiable searchsortedlast(::Any, ::Any)
+ChainRulesCore.@non_differentiable searchsorted(::Any, ::Any)

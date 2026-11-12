@@ -30,7 +30,17 @@ using Base.Broadcast: Broadcasted, AbstractArrayStyle, broadcasted, materialize
 # Utilities
 # =========
 
+# ChainRules already marks this non-differentiable,# But inference can still give up because of the Zygote -> CR wrapper layer.
+# This has been desugared from the (deprecated) @nograd macro.
+@inline function Zygote._pullback(::AContext, ::typeof(Broadcast.combine_styles), args...)
+  dargs = ntuple(_ -> nothing, length(args) + 1)
+  combine_styles_pullback(_) = dargs
+  return Broadcast.combine_styles(args...), combine_styles_pullback
+end
+
 accum_sum(xs; dims = :) = reduce(accum, xs, dims = dims)
+accum_sum(xs::AbstractArray; dims = :) =
+  dims === (:) ? unbuffer(reduce(accum!!, xs)) : reduce(accum, xs; dims)
 
 # Work around reducedim_init issue
 # https://github.com/JuliaLang/julia/issues/31427
@@ -45,18 +55,61 @@ function Base.reducedim_init(::typeof(identity), ::typeof(accum), A::AbstractArr
   Base.reducedim_initarray(A, region, nothing, Union{Nothing,eltype(A)})
 end
 
-trim(x, Δ) = reshape(Δ, ntuple(i -> size(Δ, i), Val(ndims(x))))
-
-unbroadcast(x::AbstractArray, x̄) =
-  size(x) == size(x̄) ? x̄ :
-  length(x) == length(x̄) ? trim(x, x̄) :
-    trim(x, accum_sum(x̄, dims = ntuple(i -> size(x, i) == 1 ? i : ndims(x̄)+1, Val(ndims(x̄)))))
-
+function unbroadcast(x::AbstractArray, maybethunked_x̄)
+  x̄ = unthunk_tangent(maybethunked_x̄)
+  N = ndims(x̄)
+  if length(x) == length(x̄)
+    _project(x, x̄)  # ProjectTo handles reshape, offsets, structured matrices, row vectors
+  else
+    dims = ntuple(d -> size(x, d) == 1 ? d : ndims(x̄)+1, ndims(x̄))
+    _project(x, accum_sum(x̄; dims = dims))
+  end
+end
 unbroadcast(x::Number, x̄) = accum_sum(x̄)
 unbroadcast(x::Tuple{<:Any}, x̄) = (accum_sum(x̄),)
 unbroadcast(x::Base.RefValue, x̄) = (x=accum_sum(x̄),)
+unbroadcast(x::Tuple, x̄) =  NTuple{length(x)}(length(x) == length(x̄) ? x̄ : accum_sum(x̄; dims=2:ndims(x̄))) # case length(x) > 1
+unbroadcast(x::Tuple, x̄::Nothing) = nothing
+# fixing issue #1184, not duplicate method, since the above allows for an empty tuple
+unbroadcast(x::Tuple{<:Any}, x̄::Nothing) = nothing
 
 unbroadcast(x::AbstractArray, x̄::Nothing) = nothing
+
+# A scalar operand's cotangent is a reduction over the whole broadcast (a device-to-host
+# copy on GPU) that is often unused, as for the literal in `x .+ 1f-5`, so defer it.
+lazy_cotangent(x::Number, dx) = _deferred_cotangent(dx, false)
+lazy_cotangent(x, dx) = dx()
+
+# Given the broadcast's `Δ`, so is an array's, a new array that is unused for data such as
+# the target in `ŷ .- y` (#1722). Not if it is a reduction, as the thunk would keep the
+# larger `Δ` alive, maybe to the end of the reverse pass: it is then computed at once.
+lazy_cotangent(x, Δ, dx) = lazy_cotangent(x, dx)
+lazy_cotangent(x::AbstractArray, Δ, dx) = _deferred_cotangent(dx, length(x) != length(Δ))
+
+# Memoized, as a thunk may be unthunked more than once, and of one type, computed or not.
+function _deferred_cotangent(dx::D, now::Bool) where {D}
+  T = Base.promote_op(dx)
+  T === Union{} && return dx()
+  d = Deferred{T}(dx, 1)
+  now && d()
+  return Thunk(d)
+end
+
+# The cotangents of the generic path are computed, but a scalar's still needs a sum.
+_lazy_unbroadcast(x, dx) = lazy_cotangent(x, () -> unbroadcast(x, dx))
+_lazy_unbroadcast(x, ::Nothing) = nothing
+
+# Nested AD cannot differentiate the construction of a `Thunk`, so evaluate eagerly.
+function _pullback(cx::AContext, ::typeof(lazy_cotangent), x, dx)
+  y, back = _pullback(cx, dx)
+  lazy_cotangent_pullback(Δ) = (nothing, nothing, last_or_nothing(back(Δ)))
+  return y, lazy_cotangent_pullback
+end
+function _pullback(cx::AContext, ::typeof(lazy_cotangent), x, Δ, dx)
+  y, back = _pullback(cx, dx)
+  lazy_cotangent_pullback(Δy) = (nothing, nothing, nothing, last_or_nothing(back(Δy)))
+  return y, lazy_cotangent_pullback
+end
 
 # Split Reverse Mode
 # ==================
@@ -65,23 +118,85 @@ unbroadcast(x::AbstractArray, x̄::Nothing) = nothing
 # to do CSE, then broadcast-ify the expression so that the closure captures the
 # right arrays.
 
-@adjoint broadcasted(::typeof(+), xs::Numeric...) =
-  broadcast(+, xs...), ȳ -> (nothing, map(x -> unbroadcast(x, ȳ), xs)...)
+"""
+    BroadcastBack(back)
 
-@adjoint broadcasted(::typeof(-), x::Numeric, y::Numeric) = x .- y,
-  Δ -> (nothing, unbroadcast(x, Δ), -unbroadcast(y, Δ))
-
-@adjoint broadcasted(::typeof(*), x::Numeric, y::Numeric) = x.*y,
-  z̄ -> (nothing, unbroadcast(x, z̄ .* conj.(y)), unbroadcast(y, z̄ .* conj.(x)))
-
-@adjoint function broadcasted(::typeof(/), x::Numeric, y::Numeric)
-  res = x ./ y
-  res, Δ -> (nothing, unbroadcast(x, Δ ./ conj.(y)), unbroadcast(y, -Δ .* conj.(res ./ y)))
+The pullback `back` of a broadcast with one array operand, such as `1 .- y`. Given the
+deferred cotangent of an operand of a later broadcast, it returns thunks sharing one
+evaluation of `back`, like `ScalarZBack`, so that neither is computed if those of its
+operands are dropped too, as for data `y` (#1722). The thunks of rules, such as that of
+`sum`, are mostly used, so are unthunked.
+"""
+struct BroadcastBack{F} <: Function
+  back::F
 end
+(b::BroadcastBack)(Δ) = b.back(unthunk_tangent(Δ))
+(b::BroadcastBack)(Δ::DeferredThunk) = defer_pullback(b.back ∘ unthunk_tangent, Δ)
+
+# With more, one is usually a parameter, whose cotangent is needed, and deferring would make
+# chains of small broadcasts ~50% slower.
+broadcast_back(back, xs...) =
+  count(x -> x isa AbstractArray, xs) > 1 ? back ∘ unthunk_tangent : BroadcastBack(back)
+
+@_adjoint_keepthunks broadcasted(::typeof(+), xs::Numeric...) = broadcast(+, xs...),
+  broadcast_back(ȳ -> (nothing, map(x -> lazy_cotangent(x, () -> unbroadcast(x, ȳ)), xs)...), xs...)
+
+@_adjoint_keepthunks broadcasted(::typeof(-), x::Numeric, y::Numeric) = x .- y,
+  broadcast_back(Δ -> (nothing, lazy_cotangent(x, () -> unbroadcast(x, Δ)),
+                       lazy_cotangent(y, Δ, () -> _minus(unbroadcast(y, Δ)))), x, y)
+@_adjoint_keepthunks broadcasted(::typeof(-), x::Numeric) = .-x,
+  BroadcastBack(Δ -> (nothing, _minus(Δ)))
+_minus(Δ) = -Δ
+_minus(::Nothing) = nothing
+
+@_adjoint_keepthunks broadcasted(::typeof(*), x::Numeric, y::Numeric) = x.*y,
+  broadcast_back(Δ -> (nothing, lazy_cotangent(x, Δ, () -> unbroadcast(x, Δ .* conj.(y))),
+                       lazy_cotangent(y, Δ, () -> unbroadcast(y, Δ .* conj.(x)))), x, y)
+@adjoint broadcasted(::typeof(*), x::Number, y::AbstractArray{<:Number}) =
+  _pullback(__context__, *, x, y)  # this uses dot(y,Δ) instead of sum(Δ .* conj.(y))
+@adjoint broadcasted(::typeof(*), x::AbstractArray{<:Number}, y::Number) =
+  _pullback(__context__, *, x, y)
+
+@_adjoint_keepthunks function broadcasted(::typeof(/), x::Numeric, y::Numeric)
+  res = x ./ y
+  res, broadcast_back(Δ -> (nothing, lazy_cotangent(x, Δ, () -> unbroadcast(x, Δ ./ conj.(y))),
+                            lazy_cotangent(y, Δ, () -> unbroadcast(y, .-Δ .* conj.(res ./ y)))), x, y)
+end
+@adjoint broadcasted(::typeof(/), x::AbstractArray{<:Number}, y::Number) =
+  _pullback(__context__, /, x, y)
+
+# `_pow_grad` guards against spurious `NaN`s from `0 * Inf`: when the local
+# derivative `df` is exactly zero (e.g. `x^2` at `x == 0`), the contribution is
+# zero even if the incoming sensitivity `ȳ` is infinite or `NaN`, as happens for
+# `sqrt.(x.^2)` at the cusp `x == 0` (see FluxML/Zygote.jl#1598).
+_pow_grad(ȳ, df) = iszero(df) ? zero(ȳ * df) : ȳ * df
 
 @adjoint function broadcasted(::typeof(Base.literal_pow), ::typeof(^), x::Numeric, exp::Val{p}) where p
   y = Base.literal_pow.(^, x, exp)
-  y, ȳ -> (nothing, nothing, ȳ .* p .* conj.(x .^ (p - 1)), nothing)
+  y, ȳ -> (nothing, nothing, _pow_grad.(ȳ, p .* conj.(Base.literal_pow.(^, x, Val(p - 1)))), nothing)
+end
+
+# The derivatives of `y = x^p`, with ChainRules' values at `x == 0`. `p * y / x` saves a
+# second `^`; `p * x^(p - 1)` takes over where it fails: at `x == 0`, or if `y` overflows
+# or underflows. A negative `x` has a real power only for integer `p`, and the derivative
+# in `p` is then the real part of `y * log(complex(x))`: `log(abs(x))` can't throw.
+function _pow_dx(x::Real, p::Real, y::Real)
+  dx = p * y / x
+  iszero(p) && return zero(dx)
+  isfinite(dx) && !iszero(dx) ? dx : oftype(dx, p * float(x)^(p - 1))
+end
+function _pow_dp(x::Real, p::Real, y::Real)
+  dp = y * log(abs(x))
+  iszero(x) ? (p > 0 ? zero(dp) : oftype(dp, NaN)) : dp
+end
+
+# A runtime exponent misses the `literal_pow` rule, and would otherwise be differentiated
+# per element (the CPU fallback can't use `Dual`s for `^`) or with a `Dual` exponent,
+# whose partial is `NaN` for a negative `x` (the GPU path).
+@_adjoint_keepthunks function broadcasted(::typeof(^), x::Numeric{<:Real}, p::Numeric{<:Real})
+  y = x .^ p
+  y, broadcast_back(ȳ -> (nothing, lazy_cotangent(x, ȳ, () -> unbroadcast(x, _pow_grad.(ȳ, _pow_dx.(x, p, y)))),
+                          lazy_cotangent(p, ȳ, () -> unbroadcast(p, _pow_grad.(ȳ, _pow_dp.(x, p, y))))), x, p)
 end
 
 @adjoint broadcasted(::typeof(identity), x::Numeric) = x, Δ -> (nothing, Δ)
@@ -91,14 +206,43 @@ end
   y, ȳ -> (nothing, ȳ .* conj.(1 .- y.^2))
 end
 
+# Cheaper than the `Dual` path, which stores the derivative next to each value. No trig
+# functions here: their `Dual`s compute `sin` and `cos` together, which is faster.
+@adjoint function broadcasted(::typeof(exp), x::Numeric)
+  y = exp.(x)
+  y, ȳ -> (nothing, unbroadcast(x, ȳ .* conj.(y)))
+end
+
+@adjoint broadcasted(::typeof(log), x::Numeric) =
+  log.(x), ȳ -> (nothing, unbroadcast(x, ȳ ./ conj.(x)))
+
+@adjoint function broadcasted(::typeof(sqrt), x::Numeric)
+  y = sqrt.(x)
+  y, ȳ -> (nothing, unbroadcast(x, ȳ ./ (2 .* conj.(y))))
+end
+
+@adjoint function broadcasted(::typeof(inv), x::Numeric)
+  y = inv.(x)
+  y, ȳ -> (nothing, unbroadcast(x, .-ȳ .* conj.(y) .^ 2))
+end
+
 @adjoint broadcasted(::typeof(conj), x::Numeric) =
-  conj.(x), z̄ -> (nothing, conj.(z̄))
+  conj(x), z̄ -> (nothing, conj(z̄))
 
 @adjoint broadcasted(::typeof(real), x::Numeric) =
-  real.(x), z̄ -> (nothing, real.(z̄))
+  real(x), z̄ -> (nothing, real(z̄))
 
 @adjoint broadcasted(::typeof(imag), x::Numeric) =
   imag.(x), z̄ -> (nothing, im .* real.(z̄))
+
+@adjoint broadcasted(::typeof(abs2), x::Numeric) =
+  abs2.(x), z̄ -> (nothing, 2 .* real.(z̄) .* x)
+
+# Each single-argument rule on `Numeric` is ambiguous with the generic `AbstractFill` one
+# (array.jl), so list its function here to send `Fill`s to the latter (#1688).
+for f in (:+, :-, :identity, :tanh, :exp, :log, :sqrt, :inv, :conj, :real, :imag, :abs2)
+  @eval @adjoint broadcasted(::typeof($f), x::AbstractFill{<:Real}) = _broadcast_fill(__context__, $f, x)
+end
 
 @adjoint function broadcasted(::typeof(+), a::AbstractArray{<:Number}, b::Bool)
   y = b === false ? a : a .+ b
@@ -132,6 +276,19 @@ end
   end
 end
 
+@adjoint broadcasted(::Type{T}, x::Numeric) where {T<:Number} =
+  T.(x), ȳ -> (nothing, _project(x, ȳ),)
+@adjoint broadcasted(::Type{T}, x::AbstractFill{<:Real}) where {T<:Number} =
+  _broadcast_fill(__context__, T, x)
+
+
+# Fix https://github.com/FluxML/Zygote.jl/issues/1399 by ensuring we avoid a lazier CR rule
+# https://github.com/JuliaDiff/ChainRules.jl/blob/5855c10bdbe691fc07822752f5b5865b9cea44d3/src/rulesets/Base/broadcast.jl#L199
+@_adjoint_keepthunks function broadcasted(::typeof(*), x::Numeric, y::Numeric, zs::Numeric...)
+  y, back = _broadcast_generic(__context__, *, x, y, zs...)
+  return y, Base.tail∘back
+end
+
 # General Fallback
 # ================
 
@@ -150,30 +307,50 @@ end
 # Avoid hitting special cases for `Adjoint` etc.
 _broadcast(f::F, x...) where F = materialize(broadcasted(f, x...))
 
-_get(x::Tuple, i) = x[i]
-_get(::Nothing, i) = nothing
 collapse_nothings(xs::AbstractArray{Nothing}) = nothing
 collapse_nothings(xs) = xs
 
-@adjoint function broadcasted(::AbstractArrayStyle, f, args...)
+_dual_purefun(::Type{F}) where {F<:Function} = Base.issingletontype(F)
+_dual_purefun(::Type) = false
+_dual_purefun(::Type{typeof(^)}) = false  # avoid DomainError from negative powers
+
+_dual_safearg(x::Numeric{<:Real}) = true
+_dual_safearg(x::Numeric{<:Complex}) = true
+_dual_safearg(x::Ref{<:Numeric{<:Real}}) = true
+_dual_safearg(x::Ref{<:Numeric{<:Complex}}) = true
+_dual_safearg(x::Union{Type,Val,Symbol}) = true  # non-differentiable types
+_dual_safearg(x) = false
+
+@_adjoint_keepthunks broadcasted(::AbstractArrayStyle, f::F, args...) where {F} = _broadcast_generic(__context__, f, args...)
+@inline function _broadcast_generic(__context__, f::F, args...) where {F}
+  T = Broadcast.combine_eltypes(f, args)
+  # Avoid generic broadcasting in two easy cases:
+  if T == Bool
+    return (f.(args...), _ -> nothing)
+  elseif T <: Union{Real, Complex} && isconcretetype(T) && _dual_purefun(F) && all(_dual_safearg, args) && !isderiving()
+    y, back = broadcast_forward(f, args...)
+    return y, broadcast_back(back, args...)
+  end
   len = inclen(args)
   y∂b = _broadcast((x...) -> _pullback(__context__, f, x...), args...)
-  y = map(x -> x[1], y∂b)
-  ∂b = map(x -> x[2], y∂b)
-  y, function (ȳ)
-    dxs_zip = map((∂b, ȳ) -> ∂b(ȳ), ∂b, ȳ)
-    dxs = collapse_nothings.(ntuple(i -> map(x -> _get(x, i), dxs_zip), len))
-    (nothing, accum_sum(dxs[1]), map(unbroadcast, args, Base.tail(dxs))...)
+  y = broadcast(first, y∂b)
+  function ∇broadcasted(ȳ)
+    dxs_zip = map(((_, pb), ȳ₁) -> pb(ȳ₁), y∂b, ȳ)
+    getters = ntuple(i -> StaticGetter{i}(), len)
+    dxs = map(g -> collapse_nothings(map(g, dxs_zip)), getters)
+    (nothing, accum_sum(dxs[1]), map(_lazy_unbroadcast, args, Base.tail(dxs))...)
   end
+  return y, broadcast_back(∇broadcasted, args...)
 end
 
 @adjoint function broadcasted(::AbstractArrayStyle{0}, f, args...)
-  len = inclen(args)
   y, ∂b = _broadcast((x...) -> _pullback(__context__, f, x...), args...)
-  y, function (ȳ)
+  function ∇broadcasted0(ȳ)
     dxs = ∂b(ȳ)
+    dxs === nothing && return nothing
     (nothing, dxs...)
   end
+  y, ∇broadcasted0
 end
 
 # Use the `map` adjoint in this special case, which is the same but applies
@@ -187,61 +364,609 @@ end
 
 @adjoint! (b::typeof(broadcast))(f, args...) = _pullback(__context__, broadcasted, f, args...)
 
-# Forward Mode (mainly necessary for CUDA)
+# Forward Mode -- necessary for CUDA, also used as a fast path above
 
 import ForwardDiff
-using ForwardDiff: Dual
+using ForwardDiff: Dual, Partials, value, partials
 
-dual(x, p) = x
-dual(x::Real, p) = Dual(x, p)
+# The tag of the broadcast's `Dual`s. Their derivative is the innermost, so they go outside
+# those of nested forward mode (`hessian`'s, tagged `Nothing`, or ForwardDiff's), which
+# they would otherwise be mistaken for when `f` captures one (#1725).
+struct BroadcastTag end
+ForwardDiff.:≺(::Type, ::Type{BroadcastTag}) = true
+ForwardDiff.:≺(::Type{BroadcastTag}, ::Type) = false
+# Like `Nothing`, it can't be ordered against itself: ForwardDiff's fallback throws.
+ForwardDiff.:≺(::Type{BroadcastTag}, ::Type{BroadcastTag}) =
+  invoke(ForwardDiff.:≺, Tuple{Any, Any}, BroadcastTag, BroadcastTag)
 
-dualtype(::Type{Dual{G,T,P}}) where {G,T,P} = T
-dualtype(T) = T
+# We do this because it ensures type stability so it compiles nicely on the gpu
+# The val is needed for some type stability
+# The Val{C} flag indicates whether any sibling argument is complex, so that
+# all duals in a mixed real/complex broadcast get 2N partials.
+# See https://github.com/FluxML/Zygote.jl/issues/1601
+#     https://github.com/FluxML/Zygote.jl/issues/1461
+@inline dual(x, i, ::Val{N}, ::Val{C}) where {N,C} = x
+@inline dual(x::Bool, i, ::Val{N}, ::Val{false}) where {N} = x
+@inline dual(x::Bool, i, ::Val{N}, ::Val{true}) where {N} = x
+@inline dual(x::Real, i, ::Val{N}, ::Val{false}) where {N} = Dual{BroadcastTag}(x, ntuple(==(i), N))
+@inline dual(x::Real, i, ::Val{N}, ::Val{true}) where {N} = Dual{BroadcastTag}(x, ntuple(==(i), 2N))
+# For complex since ForwardDiff.jl doesn't play nicely with complex numbers we
+# construct a Complex dual number and tag the real and imaginary parts separately
+@inline function dual(x::Complex{T}, i, ::Val{N}, ::Val{C}) where {T,N,C}
+    re_dual = Dual{BroadcastTag}(real(x), ntuple(==(i), 2N))
+    im_dual = Dual{BroadcastTag}(imag(x), ntuple(==(N+i), 2N))
+    return Complex(re_dual, im_dual)
+end
 
-function dual_function(f::F) where F
-  function (args::Vararg{Any,N}) where N
-    ds = map(args, ntuple(identity,Val(N))) do x, i
-      dual(x, ntuple(j -> i==j, Val(N)))
+# ForwardDiff's derivative of `x^p` in `p` is `NaN` for `x < 0`, from `log(x)`, and `0 * NaN`
+# for the partials of the other variables. Use ChainRules' derivatives, as on the CPU, and
+# add each partial only where it is nonzero (`_pow_grad`), so that one doesn't spoil another.
+@inline function Base.:^(x::Dual{BroadcastTag}, p::Dual{BroadcastTag})
+  vx, vp = value(x), value(p)
+  y = vx^vp
+  dx, dp = _pow_dx(vx, vp, y), _pow_dp(oftype(y, vx), vp, y)
+  ps = map((a, b) -> _pow_grad(dx, a) + _pow_grad(dp, b), partials(x).values, partials(p).values)
+  return Dual{BroadcastTag}(y, Partials(ps))
+end
+@inline function _pow_dual_exponent(x, p::Dual{BroadcastTag})
+  vp = value(p)
+  y = x^vp
+  dp = _pow_dp(oftype(y, x), vp, y)
+  return Dual{BroadcastTag}(y, Partials(map(b -> _pow_grad(dp, b), partials(p).values)))
+end
+for R in (AbstractFloat, Irrational, Integer, Rational, Real, Dual)  # ForwardDiff's, for ambiguities
+  @eval @inline Base.:^(x::$R, p::Dual{BroadcastTag}) = _pow_dual_exponent(x, p)
+end
+Base.:^(::Irrational{:ℯ}, p::Dual{BroadcastTag}) = exp(p)
+
+_iscomplex(::Complex) = true
+_iscomplex(_) = false
+
+function dualize(args::Vararg{Any, N}) where {N}
+    has_complex = Val(any(_iscomplex, args))
+    ds = map(args, ntuple(identity, N)) do x, i
+        return dual(x, i, Val(N), has_complex)
     end
-    return f(ds...)
+    return ds
+end
+
+@inline function dual_function(f::F) where F
+    function (args::Vararg{Any,N}) where N
+      ds = dualize(args...)
+      return f(ds...)
+    end
   end
+
+# `abs` is non-differentiable at the origin. ForwardDiff/DiffRules pick the
+# subgradient `1` there for real inputs, and produce `NaN` for complex inputs
+# (`abs(z) == hypot(re, im)`, whose derivative is `0/0` at the origin). Both
+# disagree with the ChainRules convention used everywhere else in Zygote, which
+# is `0`. Route the forward-mode broadcast of `abs` (the GPU `sum(abs, x)` path,
+# and `abs.(x)` on the CPU fast path) through a NaN-safe definition that matches.
+# See https://github.com/FluxML/Zygote.jl/issues/1529
+@inline dual_function(::typeof(abs)) = _abs_dualsafe ∘ only ∘ dualize
+
+@inline function _abs_dualsafe(d::Dual{T}) where {T}
+    v = value(d)
+    return Dual{T}(abs(v), sign(v) * partials(d))
+end
+@inline function _abs_dualsafe(z::Complex{<:Dual{T}}) where {T}
+    dr, di = reim(z)
+    vr, vi = value(dr), value(di)
+    a = hypot(vr, vi)
+    s = iszero(a) ? zero(a) : inv(a)  # subgradient 0 at the origin
+    return Dual{T}(a, (vr * s) * partials(dr) + (vi * s) * partials(di))
+end
+
+
+# Does this (possibly nested) type contain one of the broadcast's `Dual`s anywhere?
+_has_dual(::Type{<:Dual{BroadcastTag}}) = true
+_has_dual(::Type{<:Complex{<:Dual{BroadcastTag}}}) = true
+_has_dual(::Type{T}) where {T<:Tuple} = any(_has_dual, fieldtypes(T))
+_has_dual(::Type) = false
+_has_dual(::Type{Union{}}) = false
+
+# Recursively strip the broadcast's `Dual`s from an output element,
+# descending into `Tuple`s (e.g. the result of `broadcast(tuple, x, y)`).
+@inline _strip_dual(x::Dual{BroadcastTag}) = value(x)
+@inline _strip_dual(x::Complex{<:Dual{BroadcastTag}}) = Complex(value(real(x)), value(imag(x)))
+@inline _strip_dual(x::Tuple) = map(_strip_dual, x)
+@inline _strip_dual(x) = x
+
+# Contract an incoming cotangent element `ȳ1` with the partials of the output
+# element `o1` w.r.t. the i-th broadcast argument, descending into `Tuple`s.
+@inline _dual_partial(ȳ1::Number, o1::Dual{BroadcastTag}, i) = ȳ1 * partials(o1, i)
+@inline _dual_partial(ȳ1::Number, o1::Complex{<:Dual{BroadcastTag}}, i) =
+  real(ȳ1) * partials(real(o1), i) + imag(ȳ1) * partials(imag(o1), i)
+@inline _dual_partial(ȳ1::Tuple, o1::Tuple, i) = _dual_partial_sum(false, ȳ1, o1, i)
+@inline _dual_partial(ȳ1, o1, i) = false  # missing cotangent component, or no partials → zero contribution
+
+# A left fold like `mapreduce`, which on Julia 1.10 indexes heterogeneous tuples at runtime
+# and fails to compile in a GPU kernel. `false + x === x`, so the sum is unchanged.
+@inline _dual_partial_sum(acc, ȳ1::Tuple, o1::Tuple, i) =
+  _dual_partial_sum(acc + _dual_partial(first(ȳ1), first(o1), i), Base.tail(ȳ1), Base.tail(o1), i)
+@inline _dual_partial_sum(acc, ::Tuple{}, ::Tuple, i) = acc
+@inline _dual_partial_sum(acc, ::Tuple, ::Tuple{}, i) = acc
+@inline _dual_partial_sum(acc, ::Tuple{}, ::Tuple{}, i) = acc
+
+# Forward mode also differentiates w.r.t. the floating-point fields of `f` (e.g. variables
+# captured by a closure), which the GPU path has no other way to reach (#1701), also when
+# nested in tuples, structs or other closures, or `Dual`s of nested forward mode (#1725).
+# Integer fields are left alone: as `Dual`s they would break `x^n`.
+_float_leaf(::Type{<:Union{AbstractFloat, Dual}}) = true
+_float_leaf(::Type{Complex{T}}) where {T} = _float_leaf(T)
+_float_leaf(::Type) = false
+
+# The floating-point leaves of a `T`, as a tree like its fields: a leaf is its type, a field
+# without any is `nothing`. This and the next helpers work on types, for the generators below.
+function _float_tree(T)
+  _float_leaf(T) && return T
+  (isconcretetype(T) && isstructtype(T) && !ismutabletype(T) && !(T <: Union{Number, AbstractArray})) ||
+    return nothing
+  ts = Any[_float_tree(fieldtype(T, i)) for i in 1:fieldcount(T)]
+  return all(isnothing, ts) ? nothing : ts
+end
+
+_dual_leaftype(::Type{T}, n) where {T<:Real} = Dual{BroadcastTag, promote_type(T, Bool), n}
+_dual_leaftype(::Type{Complex{T}}, n) where {T} = Complex{_dual_leaftype(T, n)}
+
+# The type of a `T` with fields of types `S`, valid when each changed field is typed by its own
+# type parameter (as for closures), else `nothing`.
+function _retype(T, S)
+  T <: Tuple && return Tuple{S...}
+  T <: NamedTuple && return NamedTuple{fieldnames(T), Tuple{S...}}
+  W = T.name.wrapper
+  vars, body = Any[], W
+  while body isa UnionAll
+    push!(vars, body.var)
+    body = body.body
+  end
+  params = Any[T.parameters...]
+  for (i, Si) in enumerate(S)
+    Si == fieldtype(T, i) && continue
+    k = findfirst(v -> v === body.types[i], vars)
+    (k === nothing || !(vars[k].lb <: Si <: vars[k].ub)) && return nothing
+    params[k] = Si
+  end
+  R = W{params...}
+  return fieldtypes(R) == Tuple(S) ? R : nothing
+end
+
+# With the leaves of `tree` as `Dual`s of `n` partials, the type of a copy of a `T`, and the
+# tree of the leaves it can hold, whose nodes are `(type of the copy, children)`.
+function _dual_plan(T, tree, n)
+  tree === nothing && return T, nothing
+  tree isa Type && return _dual_leaftype(T, n), T
+  sub = [_dual_plan(fieldtype(T, i), tree[i], n) for i in eachindex(tree)]
+  all(s -> s[2] === nothing, sub) && return T, nothing
+  R = _retype(T, first.(sub))
+  R === nothing && return T, nothing
+  return R, (R, Any[last(s) for s in sub])
+end
+
+_dual_leaves(t) = t === nothing ? Any[] : t isa Type ? Any[t] : reduce(vcat, map(_dual_leaves, t[2]))
+_dual_shape(t) = t isa Tuple ? map(_dual_shape, t[2]) : t
+
+# The tree of the leaves of `F` that a copy can hold as `Dual`s, and their number of partials,
+# which only the type parameters' bounds could make depend on each other.
+function _dual_plan(F)
+  tree = _float_tree(F)
+  tree === nothing && return nothing, nothing, 0
+  _, kept = _dual_plan(F, tree, 0)
+  ls = _dual_leaves(kept)
+  n = any(T -> T <: Complex, ls) ? 2 * length(ls) : length(ls)
+  _, kept′ = _dual_plan(F, tree, n)
+  return tree, (_dual_shape(kept′) == _dual_shape(kept) ? kept′ : nothing), n
+end
+
+# The paths, as in `f.a.b` or `f.t[1]`, to the leaves of `tree` not in `kept`.
+function _lost_leaves(T, tree, kept, path = "f", out = String[])
+  tree === nothing && return out
+  if tree isa Type
+    kept === nothing && push!(out, path)
+  else
+    for i in eachindex(tree)
+      p = T <: Tuple ? "$path[$i]" : "$path.$(fieldname(T, i))"
+      _lost_leaves(fieldtype(T, i), tree[i], kept === nothing ? nothing : kept[2][i], p, out)
+    end
+  end
+  return out
+end
+
+# A copy of `f` with its floating-point leaves as `Dual`s where it can hold them (`f` itself if
+# nowhere), or `nothing` if it has none.
+@generated function _dualize_fields(f::F) where {F}
+  tree, kept, n = _dual_plan(F)
+  tree === nothing && return nothing
+  ls = _dual_leaves(kept)
+  N, C = Val(length(ls)), Val(n > length(ls))
+  k = 0
+  function build(ex, t)
+    t === nothing && return ex
+    t isa Type && return :(dual($ex, $(k += 1), $N, $C))
+    R, fs = t[1], [build(:(getfield($ex, $i)), c) for (i, c) in enumerate(t[2])]
+    R <: Tuple ? :(($(fs...),)) : R <: NamedTuple ? :($R(($(fs...),))) : :(__splatnew__($R, ($(fs...),)))
+  end
+  return build(:f, kept)
+end
+
+# The leaves of `f` that `_dualize_fields(f)` turns into `Dual`s, in the order of their partials.
+@generated function _dual_leaf_values(f::F) where {F}
+  _, kept, _ = _dual_plan(F)
+  exs = Any[]
+  walk(ex, t) = t === nothing ? nothing : t isa Type ? push!(exs, ex) :
+    foreach(((i, c),) -> walk(:(getfield($ex, $i)), c), enumerate(t[2]))
+  walk(:f, kept)
+  return :(($(exs...),))
+end
+
+# The cotangent of an `F`, given those of the leaves of `_dual_leaf_values`.
+@generated function _dual_leaves_tangent(::Type{F}, grads) where {F}
+  _, kept, _ = _dual_plan(F)
+  k = 0
+  function build(T, t)
+    t === nothing && return nothing
+    t isa Type && return :(grads[$(k += 1)])
+    fs = [build(fieldtype(T, i), c) for (i, c) in enumerate(t[2])]
+    T <: Tuple ? :(($(fs...),)) : :(NamedTuple{$(fieldnames(T))}(($(fs...),)))
+  end
+  return build(F, kept)
+end
+
+# With `all`, all the leaves, as when calling `f` with `Dual`s fails.
+@generated function _lost_dual_leaves(::Type{F}, ::Val{all}) where {F, all}
+  tree, kept, _ = _dual_plan(F)
+  return Tuple(_lost_leaves(F, tree, all ? nothing : kept))
+end
+
+@noinline function _warn_lost_dual_leaves(F, lost, failed)
+  why = failed ?
+    "calling `f` with `ForwardDiff.Dual`s in their place fails, e.g. at a type assertion or `Float32(x)`" :
+    "`ForwardDiff.Dual`s don't fit in a field of a concrete type, unlike one typed by a type parameter"
+  @warn """Zygote returns `nothing` for the gradient with respect to $(join(lost, ", ")), where \
+           `f::$F` is broadcast over a GPU array, as forward mode can't differentiate them: $why.""" maxlog=1 _id=Symbol(:dual_leaves_, objectid(F))
+end
+
+@inline _field_partial(ȳ1, o1, ::Real, i, n) = _dual_partial(ȳ1, o1, i)
+@inline _field_partial(ȳ1, o1, ::Complex, i, n) = Complex(_dual_partial(ȳ1, o1, i), _dual_partial(ȳ1, o1, n + i))
+
+# The cotangent of `f`, through `fd = _dualize_fields(f)` evaluated at the plain
+# `args`, so that the partials of the fields and of the arguments never mix.
+function _dual_fields_grad(f::F, fd, ȳ, args...) where {F}
+  T = Broadcast.combine_eltypes(fd, args)
+  failed = !isconcretetype(T)
+  lost = _lost_dual_leaves(F, Val(failed))
+  isempty(lost) || _warn_lost_dual_leaves(F, lost, failed)
+  (failed || !_has_dual(T)) && return nothing
+  leaves = _dual_leaf_values(f)
+  n = length(leaves)
+  grads = map(leaves, ntuple(identity, Val(n))) do x, i
+    bc = Broadcast.broadcasted((ȳ1, xs...) -> _field_partial(ȳ1, fd(xs...), x, i, n), ȳ, args...)
+    sum(Broadcast.instantiate(bc))
+  end
+  return _dual_leaves_tangent(F, grads)
 end
 
 @inline function broadcast_forward(f, args::Vararg{Any,N}) where N
-  T = Broadcast.combine_eltypes(f, args)
-  out = dual_function(f).(args...)
-  eltype(out) <: Dual || return (out, _ -> nothing)
-  y = map(x -> x.value, out)
-  _back(ȳ, i) = unbroadcast(args[i], ((a, b) -> a*b.partials[i]).(ȳ, out))
-  back(ȳ) = ntuple(i -> _back(ȳ, i), N)
-  return y, back
+  y, back = _broadcast_forward_args(f, args...)
+  fd = _dualize_fields(f)
+  fd === nothing && return y, back
+  function bc_fwd_back_fields(ȳ)
+    dargs = back(ȳ)
+    dxs = dargs === nothing ? map(_ -> nothing, args) : Base.tail(Base.tail(dargs))
+    (nothing, _dual_fields_grad(f, fd, ȳ, args...), dxs...)
+  end
+  return y, bc_fwd_back_fields
 end
 
-@init @require CUDA="052768ef-5323-5732-b1bb-66c8b64840ba" begin
-  const CuArrayStyle = CUDA.CuArrayStyle
+@inline function _broadcast_forward_args(f, args::Vararg{Any,N}) where N
+  if _recompute_duals(args) && !any(a -> eltype(a) <: Complex, args)
+    T = Broadcast.combine_eltypes(dual_function(f), args)
+    isconcretetype(T) && T <: Dual{BroadcastTag} && return _broadcast_forward_recompute(f, args...)
+  end
+  out = dual_function(f).(args...)
+  T = eltype(out)
+  if T <: Union{Dual{BroadcastTag}, Complex{<:Dual{BroadcastTag}}}
+    if any(eltype(a) <: Complex for a in args)
+      return _broadcast_forward_complex(T, out, args...)
+    else
+      return _broadcast_forward(T, out, args...)
+    end
+  elseif _has_dual(T)
+    # The output element is a `Tuple` (possibly nested) of `Dual`s, as produced by
+    # e.g. `broadcast(tuple, x, y)`. Strip the `Dual`s from the returned value and
+    # contract the partials in the pullback, rather than leaking `Dual`s to the
+    # caller and returning a `nothing` gradient. See FluxML/Zygote.jl#1424.
+    return _broadcast_forward_tuple(out, args...)
+  else
+    return (out, _ -> nothing)
+  end
+end
 
-  if isdefined(CUDA, :cufunc)
-    @eval @adjoint function broadcasted(::CuArrayStyle, f, args...)
-      y, back = broadcast_forward(CUDA.cufunc(f), args...)
-      y, ȳ -> (nothing, nothing, back(ȳ)...)
+# Real input, `Tuple`-of-`Dual` output (e.g. `broadcast(tuple, x, y)`).
+@inline function _broadcast_forward_tuple(out, args::Vararg{Any, N}) where {N}
+  valN = Val(N)
+  y = broadcast(_strip_dual, out)
+  function bc_fwd_back(ȳ)
+    dargs = ntuple(valN) do i
+      lazy_cotangent(args[i], ȳ, () -> unbroadcast(args[i], broadcast((ȳ1, o1) -> _dual_partial(ȳ1, o1, i), ȳ, out)))
     end
-  else # CUDA >= 3.0
-    @eval @adjoint function broadcasted(::CuArrayStyle, f, args...)
-      y, back = broadcast_forward(f, args...)
-      y, ȳ -> (nothing, nothing, back(ȳ)...)
+    (nothing, nothing, dargs...) # nothings for broadcasted & f
+  end
+  return y, bc_fwd_back
+end
+
+# Real input and real output pullback
+@inline function _broadcast_forward(::Type{<:Dual}, out, args::Vararg{Any, N}) where {N}
+  valN = Val(N)
+  y = broadcast(x -> value(x), out)
+  function bc_fwd_back(ȳ)
+    dargs = ntuple(valN) do i
+      lazy_cotangent(args[i], ȳ, () -> unbroadcast(args[i], broadcast((y1, o1) -> y1 * partials(o1,i), ȳ, out)))
     end
+    (nothing, nothing, dargs...) # nothings for broadcasted & f
+  end
+  return y, bc_fwd_back
+end
+
+# This handles the complex output and real input pullback
+@inline function _broadcast_forward(::Type{<:Complex}, out, args::Vararg{Any, N}) where {N}
+    valN = Val(N)
+    y = broadcast(x -> Complex(value(real(x)), value(imag(x))), out)
+    function bc_fwd_back(ȳ)
+      dargs = ntuple(valN) do i
+        lazy_cotangent(args[i], ȳ, () -> unbroadcast(args[i], broadcast((y1, o1) -> (real(y1)*partials(real(o1),i) + imag(y1)*partials(imag(o1), i)), ȳ, out)))
+      end
+      (nothing, nothing, dargs...) # nothings for broadcasted & f
+    end
+    return y, bc_fwd_back
   end
 
-  @adjoint CUDA.CuArray{N,T}(xs::Array) where {N,T} =
-    CUDA.CuArray{N,T}(xs), Δ -> (convert(Array, Δ), )
+_dual_inert(x) = !(eltype(x) <: Real) || eltype(x) <: Bool
 
-  @adjoint function sum(xs::CUDA.CuArray; dims = :)
-    placeholder = similar(xs)
-    sum(xs, dims = dims), Δ -> (placeholder .= Δ,)
+# Real input and output, computing `f` on plain values and the `Dual`s again in the pullback,
+# rather than keeping the (N+1)× larger `Dual` array from the forward pass.
+@inline function _broadcast_forward_recompute(f, args::Vararg{Any, N}) where {N}
+  y = broadcast(f, args...)
+  df = dual_function(f)
+  lanes = _array_lanes(args, Val(ndims(y)))
+  function bc_fwd_back(ȳ)
+    ps = _lane_partials(df, ȳ, args, lanes)
+    dargs = ntuple(Val(N)) do i
+      _dual_inert(args[i]) && return nothing
+      lazy_cotangent(args[i], ȳ, () -> unbroadcast(args[i], _arg_partials(ps, lanes, df, ȳ, args, i)))
+    end
+    (nothing, nothing, dargs...) # nothings for broadcasted & f
+  end
+  return y, bc_fwd_back
+end
+
+# Each partial needs all the `Dual`s, so those of all array arguments come from one broadcast, along an
+# extra last dimension (#1695). It runs when one is needed, and their slices are arrays of their own.
+@generated function _array_lanes(args::Tuple, ::Val{nd}) where {nd}
+  L = Tuple(i for (i, T) in enumerate(fieldtypes(args)) if T <: AbstractArray && !_dual_inert(T))
+  return length(L) > 1 && nd > 0 ? Val((L, nd)) : nothing
+end
+
+_lane_partials(df, ȳ, args, ::Nothing) = nothing
+function _lane_partials(df, ȳ, args, ::Val{Lnd}) where {Lnd}
+  L, nd = Lnd
+  k = reshape(Base.OneTo(length(L)), ntuple(_ -> 1, Val(nd))..., length(L))
+  lane(k, y1, xs...) = (o = df(xs...); y1 * _select(map(i -> partials(o, i), L), k))
+  return _deferred_cotangent(() -> broadcast(lane, k, ȳ, args...), false)
+end
+
+# `t[k]` without indexing a tuple at runtime, which on the GPU spills it to local memory.
+@inline _select(t::Tuple{Any}, k) = t[1]
+@inline _select(t::Tuple, k) = ifelse(k == 1, first(t), _select(Base.tail(t), k - 1))
+
+_arg_partials(::Nothing, ::Nothing, df, ȳ, args, i) = broadcast((y1, xs...) -> y1 * partials(df(xs...), i), ȳ, args...)
+function _arg_partials(ps, ::Val{Lnd}, df, ȳ, args, i) where {Lnd}
+  L, nd = Lnd
+  j = findfirst(==(i), L)
+  j === nothing && return _arg_partials(nothing, nothing, df, ȳ, args, i)
+  return selectdim(unthunk(ps), nd + 1, j)
+end
+
+# This handles complex input and real output. We use the gradient definition from ChainRules here
+# since it agrees with what Zygote did for real(x).
+@inline function _broadcast_forward_complex(::Type{<:Dual}, out, args::Vararg{Any, N}) where {N}
+    valN = Val(N)
+    y = broadcast(x -> value(x), out)
+    function bc_fwd_back(ȳ)
+      dargs = ntuple(valN) do i
+        lazy_cotangent(args[i], ȳ, () -> unbroadcast(args[i], broadcast((y1, o1) -> y1 * Complex(partials(o1, i), partials(o1, i+N)), ȳ, out)))
+      end
+      (nothing, nothing, dargs...) # nothings for broadcasted & f
+    end
+    return y, bc_fwd_back
+end
+
+# # # This is for complex input and complex output
+# If we assume that
+# f(x + iy) = u(x,y) + iv(x,y)
+# then we do the following for the adjoint
+# Δu ∂u/∂x + Δv∂v/∂x + i(Δu∂u/∂y + Δv ∂v/∂y )
+# this follows https://juliadiff.org/ChainRulesCore.jl/stable/maths/complex.html
+function _adjoint_complex(N, Δz, df, i)
+    Δu, Δv = reim(Δz)
+    du, dv = reim(df)
+    return Complex(Δu*partials(du, i) + Δv*partials(dv, i), Δu*partials(du, i+N) + Δv*partials(dv, i+N))
+end
+
+@inline function _broadcast_forward_complex(::Type{<:Complex}, out, args::Vararg{Any, N}) where {N}
+    valN = Val(N)
+    y = broadcast(x -> Complex(value(real(x)), value(imag(x))), out)
+    function bc_fwd_back(ȳ)
+      dargs = ntuple(valN) do i
+        lazy_cotangent(args[i], ȳ, () -> unbroadcast(args[i], broadcast((y1, o1) -> _adjoint_complex(N, y1, o1, i), ȳ, out)))
+      end
+      (nothing, nothing, dargs...) # nothings for broadcasted & f
+    end
+    return y, bc_fwd_back
+end
+
+using GPUArraysCore  # replaces @require CUDA block, weird indenting to preserve git blame
+
+       # Ordinary broadcasting calls broadcast_forward anyway when certain its' safe,
+       # so perhaps this can be deleted? Possible edge case here:
+       # https://github.com/FluxML/Zygote.jl/pull/1018#issuecomment-873629415
+  @_adjoint_keepthunks function broadcasted(::AbstractGPUArrayStyle, f, args...)
+    # Bool-valued broadcasts (e.g. `x .> 3`) are non-differentiable and must be
+    # evaluated on the plain values: running predicates like `>` through ForwardDiff
+    # `Dual`s gives wrong results, because ForwardDiff (>= v1) compares Duals with a
+    # total order that breaks value-ties using the partials. See
+    # https://github.com/FluxML/Zygote.jl/issues/1597
+    # This mirrors the `T == Bool` short-circuit in `_broadcast_generic` above.
+    if Broadcast.combine_eltypes(f, args) == Bool
+      return (f.(args...), _ -> nothing)
+    end
+    y, back = broadcast_forward(f, args...)
+    return y, broadcast_back(back, args...)
   end
 
-  @adjoint function Base.convert(::Type{T}, xs::Array)  where {T<:CUDA.CuArray}
+  # GPU broadcasts are bound by memory traffic, not arithmetic (#1696).
+  _recompute_duals(args) = any(a -> a isa AnyGPUArray, args)
+
+  @adjoint (::Type{T})(xs::Array) where {T <: AbstractGPUArray} =
+    T(xs), Δ -> (convert(Array, Δ), )
+
+  # `Array`/`collect` move a GPU array to the host; their pullback must move the
+  # cotangent back to the device. Otherwise it stays a CPU array and a later
+  # operation that broadcasts it against the GPU primal (e.g. `A*x` in the
+  # original report) hits scalar indexing or fails to compile. See #1305.
+  # `copyto!(similar(xs, ...), Δ)` relocates without naming a specific GPU
+  # backend and without scalar indexing.
+  _gpu_cotangent(xs, Δ::AbstractGPUArray) = Δ
+  _gpu_cotangent(xs, Δ::AbstractArray) = copyto!(similar(xs, eltype(Δ), size(Δ)), Δ)
+
+  @adjoint Array(xs::AbstractGPUArray) = Array(xs), Δ -> (_gpu_cotangent(xs, Δ),)
+  @adjoint collect(xs::AbstractGPUArray) = collect(xs), Δ -> (_gpu_cotangent(xs, Δ),)
+
+  # Make sure sum(f, ::CuArray) uses broadcast through forward-mode defined above
+  # Not the ChainRules.rrule which will use the Zygote.Context and thus not be GPU compatible
+  # `AnyGPUArray` (rather than `AbstractGPUArray`) also covers GPU array wrappers
+  # such as `view`/`SubArray`, `Adjoint` and `Transpose`, whose generic
+  # `sum(f, x)` rrule otherwise scalar-indexes on the GPU. See #1498.
+  function _pullback(cx::AContext, ::typeof(sum), f, xs::AnyGPUArray)
+    res, back = _pullback(cx, (f, xs) -> sum(f.(xs)), f, xs)
+    return res, back ∘ unthunk_tangent
+  end
+  function _pullback(cx::AContext, ::Core.kwftype(typeof(sum)), kws, ::typeof(sum), f,
+                     xs::AnyGPUArray)
+    @assert !haskey(kws, :init) # TODO add init support (julia 1.6)
+    res, back = _pullback(cx, (f, xs) -> sum(f.(xs); kws...), f, xs)
+    sum_gpuarray_kw_pullback(Δ) = (nothing, nothing, back(unthunk_tangent(Δ))...)
+    return res, sum_gpuarray_kw_pullback
+  end
+
+  # `∇map` stores each element's pullback, which captures the `Context`, in a device
+  # array, which fails to compile on the GPU (#1701). When the sizes agree, GPUArrays'
+  # `map` is a broadcast, so differentiate it as one. Other cases keep `∇map`.
+  function _pullback(cx::AContext, ::typeof(map), f, x::AnyGPUArray,
+                     xs::Union{AnyGPUArray, AbstractRange}...)
+    args = (x, xs...)
+    allequal(map(size, args)) || return ∇map(cx, f, args...)
+    # A 0-dim broadcast returns a scalar, unlike `map`.
+    ndims(x) == 0 && return _pullback(cx, _map0, f, args...)
+    return _pullback(cx, broadcast, f, args...)
+  end
+  _map0(f, xs...) = _device_cotangent(reshape(broadcast(f, map(vec, xs)...), ()))
+
+  # The cotangent of a 0-dim GPU array may be on the host, as from ChainRules' `sum`.
+  _device_cotangent(x) = x
+  @adjoint _device_cotangent(x) = x, Δ -> (Δ isa AbstractArray ? _gpu_cotangent(x, Δ) : Δ,)
+
+  # `accumulate` on the CPU keeps the pullback of each step (#1684), which the GPU can't.
+  # But the cotangent of a scan is a scan backwards, of the affine maps `g -> ∂a * g + Δy`
+  # (`∂a` the partial of `op` in its accumulator), which compose associatively, so it can
+  # use the GPU's parallel `accumulate`, with the partials from forward mode.
+  _affine_compose((a1, c1), (a2, c2)) = (a1 * a2, a2 * c1 + c2)
+  _partials2(o) = (_dual_partial(true, o, 1), _dual_partial(true, o, 2))
+
+  function _pullback(cx::AContext, ::typeof(accumulate), op::F, xs::AnyGPUArray{<:AbstractFloat}) where {F}
+    y, back = _accumulate_pullback(cx, op, xs, nothing, NamedTuple())
+    accumulate_gpu_pullback(Δ) = ((Δop, Δxs, _) = back(unthunk_tangent(Δ)); (nothing, Δop, Δxs))
+    accumulate_gpu_pullback(::Nothing) = nothing
+    return y, accumulate_gpu_pullback
+  end
+
+  function _accumulate_pullback(cx, op::F, xs::AnyGPUArray{<:AbstractFloat}, dims::Union{Nothing, Integer},
+                                kw::Union{NamedTuple{()}, NamedTuple{(:init,), <:Tuple{Real}}}) where {F}
+    if dims === nothing  # in linear order, like Base
+      y, back = _accumulate_pullback(cx, op, vec(xs), 1, kw)
+      return reshape(y, axes(xs)), Δ -> ((Δop, Δxs, Δkw) = back(vec(Δ)); (Δop, reshape(Δxs, axes(xs)), Δkw))
+    end
+    y = accumulate(op, xs; dims, kw...)
+    (dims > ndims(xs) || isempty(xs)) && return y, Δ -> (nothing, Δ, nothing)
+    return y, Δ -> _∇accumulate_gpu(op, xs, y, dims, kw, Δ)
+  end
+
+  function _∇accumulate_gpu(op::F, xs, y, d, kw, Δy) where {F}
+    n = size(xs, d)
+    head(a) = selectdim(a, d, 1:1)
+    prev(a) = selectdim(a, d, 1:n-1)
+    rest(a) = selectdim(a, d, 2:n)
+    df = dual_function(op)
+    ∂rest = broadcast((a, b) -> _partials2(df(a, b)), prev(y), rest(xs))
+    ∂a = fill!(similar(y), 0)
+    prev(∂a) .= first.(∂rest)  # shifted, to pair step k + 1 with the cotangent of y[k]
+    h = accumulate(_affine_compose, reverse(tuple.(∂a, Δy); dims=d); dims=d)
+    g = reverse(last.(h); dims=d)  # the cotangent of y, through all later steps
+    Δxs = similar(g)
+    rest(Δxs) .= last.(∂rest) .* rest(g)
+    fd = _dualize_fields(op)
+    Δop = fd === nothing ? nothing : _dual_fields_grad(op, fd, rest(g), prev(y), rest(xs))
+    if isempty(kw)  # y[1] = xs[1]
+      head(Δxs) .= head(g)
+      return Δop, Δxs, nothing
+    end
+    ∂head = broadcast(b -> _partials2(df(kw.init, b)), head(xs))
+    head(Δxs) .= last.(∂head) .* head(g)
+    fd === nothing || (Δop = accum(Δop, _dual_fields_grad(op, fd, head(g), kw.init, head(xs))))
+    return Δop, Δxs, (init = sum(first.(∂head) .* head(g)),)
+  end
+
+  @adjoint function Base.convert(::Type{T}, xs::Array)  where {T<:AbstractGPUArray}
     Base.convert(T, xs), Δ -> (nothing, Base.convert(Array, Δ),)
   end
 
-end
+  pull_block_vert(sz, Δ::AbstractGPUArray, A::Number) = @allowscalar Δ[sz]
+
+  # `forward_jacobian` (used by `hessian`/`diaghessian`) seeds ForwardDiff `Dual`s
+  # with `map(x, reshape(1:length(x), ...))` and extracts their partials with a
+  # scalar `getindex` loop. Both scalar-index a GPU array (`hessian` on a CuArray
+  # errored, #1348, #1312). Reimplement them with device broadcasts/maps.
+  _seed_dual(x, i, offset, ::Val{N}) where {N} =
+    ForwardDiff.Dual(x, ntuple(j -> j + offset == i, Val(N)))
+  seed(x::AbstractGPUArray, ::Val{N}, offset = 0) where {N} =
+    _seed_dual.(x, LinearIndices(x), offset, Val(N))
+
+  function extract(xs::AbstractGPUArray{ForwardDiff.Dual{T,V,N}}) where {T,V,N}
+    values = map(ForwardDiff.value, xs)
+    J = similar(xs, V, N, length(xs))
+    for j in 1:N
+      J[j, :] = vec(map(d -> ForwardDiff.partials(d, j), xs))
+    end
+    return values, J
+  end
+          
+          
+  # Accumulating cotangents `accum`ulates by broadcasting `+`. When one cotangent
+  # is a host-backed structured array (e.g. the `Diagonal{<:Fill}` returned by
+  # the `tr` adjoint) and the other is a GPU array, that broadcast runs on the
+  # host and scalar-indexes the GPU array (`gradient(x -> sum(abs2,x) - tr(x), cu)`
+  # in #1512). Move the host operand onto the device first, then accumulate there.
+  # Wrapped GPU arrays (`Transpose`, `Adjoint`, views, ...) already broadcast on
+  # the device, so they are not copied (#1676).
+  _gpu_like(ref::AnyGPUArray, y::AnyGPUArray) = y
+  _gpu_like(ref::AnyGPUArray, y::AbstractArray) = copyto!(similar(ref, eltype(y), size(y)), collect(y))
+  # `collect(y)` would build an n×n host matrix for the `tr` adjoint; build it on the device.
+  function _gpu_like(ref::AnyGPUArray, y::Diagonal{<:Any,<:AbstractFill})
+    z = fill!(similar(ref, eltype(y), size(y)), zero(eltype(y)))
+    view(z, diagind(z)) .= getindex_value(y.diag)
+    return z
+  end
+  accum(x::AnyGPUArray, y::AnyGPUArray) = Base.broadcast_preserving_zero_d(accum, x, y)
+  accum(x::AnyGPUArray, y::AbstractArray) = accum(x, _gpu_like(x, y))
+  accum(x::AbstractArray, y::AnyGPUArray) = accum(_gpu_like(y, x), y)

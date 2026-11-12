@@ -1,20 +1,22 @@
 steps:
-  - label: "GPU integration - julia 1.5"
+  - label: "GPU integration - julia v1.10"
     plugins:
       - JuliaCI/julia#v1:
-          version: "1.5"
+          version: "1.10"
       - JuliaCI/julia-test#v1: ~
+    command:
+      - mkdir -p "$${JULIA_DEPOT_PATH}/conda/3/x86_64"
     agents:
-      queue: "juliagpu"
-      cuda: "*"
+      queue: "cuda"
     timeout_in_minutes: 60
 
-  - label: "GPU integration - julia 1.6"
+  - label: "GPU integration - julia v1"
     plugins:
       - JuliaCI/julia#v1:
-          version: '1.6'
+          version: "1"
       - JuliaCI/julia-test#v1: ~
+    command:
+      - mkdir -p "$${JULIA_DEPOT_PATH}/conda/3/x86_64"
     agents:
-      queue: "juliagpu"
-      cuda: "*"
+      queue: "cuda"
     timeout_in_minutes: 60

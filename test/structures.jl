@@ -1,4 +1,5 @@
-using Zygote, Test
+using Zygote: bufferfrom
+using Base.Threads: @spawn
 
 function tasks1(x)
   ch = Channel(Inf)
@@ -33,19 +34,21 @@ tasks4(x) = fetch(@async x^2)
 tasks5(x) = fetch(schedule(Task(() -> x^2)))
 @test gradient(tasks5, 5) == (10,)
 
-include("threads.jl")
+@static if isdefined(Base, :ScopedValues)
+  const scoped = Base.ScopedValues.ScopedValue(1.0)
+  function with_scope(x)
+    y = sin(x)
+    Base.ScopedValues.@with(scoped => 2.0, x * scoped[]) + 0 * y
+  end
+  @test gradient(with_scope, 3.0) == (2.0,)
+end
 
 @test Zygote.pullback(Array, [1f0])[1] == [1f0]
 
-@testset "#300" begin
-  t = (rand(2, 2), rand(2, 2))
-  ps = Params(t)
-  gs = gradient(()->sum(t[1]), ps)
-  @test gs[t[1]] == ones(2, 2)
-end
+# NOTE: implicit-params test "#300" lives in test/deprecated.jl
 
 struct A594 x::Float64 end
-  
+
 @testset "#594" begin
   f(a,v) = a.x + v
   g(A,V) = sum(f.(A,V))
@@ -53,6 +56,7 @@ struct A594 x::Float64 end
   Y = randn(2,2)
   ∇ = gradient(g,X,Y)
   @test ∇[1] == [(x = 2.0,); (x = 2.0,)]
+  @test vec(∇[1]) == [(x = 2.0,); (x = 2.0,)]
   @test ∇[2] == [1 1; 1 1]
 end
 
@@ -63,5 +67,49 @@ end
   end
 
   m, b = Zygote._pullback(Zygote.Context(), nameof, M)
-  @test b(m) == (nothing, nothing)
+  @test b(m) === nothing
+end
+
+# https://github.com/FluxML/Zygote.jl/issues/1517
+struct FewerArgs1517
+  x::Float64
+  y::Float64
+  FewerArgs1517(x) = new(x)  # inner constructor leaves `y` undefined
+end
+
+@testset "new with fewer arguments than fields (#1517)" begin
+  @test gradient(x -> FewerArgs1517(x).x * 2, 2.0) == (2.0,)
+  @test gradient(x -> 3 * FewerArgs1517(x).x, 5.0) == (3.0,)
+end
+
+@testset "threads" begin
+    function threads1(x)
+      ch = Channel(0)
+      @sync begin
+        @spawn put!(ch, x^2)
+        take!(ch)
+      end
+    end
+
+    @test gradient(threads1, 5) == (10,)
+
+    function threads2(xs)
+      n = length(xs)
+      chunks = view(xs, 1:n÷2), view(xs, n÷2+1:n)
+      p = bufferfrom([0.0, 0.0])
+      @sync begin
+        for i = 1:2
+          @spawn begin
+            s = zero(eltype(chunks[i]))
+            for j = 1:length(chunks[i])
+              s += chunks[i][j]
+            end
+            p[i] = s
+          end
+        end
+      end
+      return p[1]+p[2]
+    end
+
+    @test gradient(threads2, [1, 2, 3, 4]) == ([1, 1, 1, 1],)
 end

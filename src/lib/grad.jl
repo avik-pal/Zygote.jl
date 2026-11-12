@@ -1,15 +1,3 @@
-using MacroTools: @q
-
-macro nograd(ex)
-  isexpr(ex, :tuple) || (ex = Expr(:tuple, ex))
-  blk = @q begin end
-  for f in ex.args
-    back = MacroTools.@q _ -> ($__source__; nothing)
-    push!(blk.args, :(@inline Zygote._pullback(::Context, ::Core.Typeof($(esc(f))), args...) = $(esc(f))(args...), $back))
-  end
-  return blk
-end
-
 macro which(ex)
   @capture(ex, f_(args__)) || error("Zygote.@which f(args...)")
   :(InteractiveUtils.@which adjoint(Context(), $(esc(f)), $(esc.(args)...)))
@@ -23,7 +11,7 @@ Use gradient checkpointing on the call `f(xs...)`. This means that
 `checkpointed(f, xs...) === f(xs...)`, but when computing the derivative
 intermediate results from the forward pass of `f` will not be stored. Instead the forward
 pass will be repeated, when computing the derivative.
-This saves memory at the cost of increasing exectution time.
+This saves memory at the cost of increasing execution time.
 
 !!! warning
     If `f` is not a pure function, `checkpointed` will likely give wrong results.
@@ -39,6 +27,46 @@ function Zygote._pullback(ctx::Zygote.AContext, ::typeof(checkpointed), f, xs...
     return y, pullback_checkpointed
 end
 
+
+
+"""
+
+    eager_update!(state, model, update!)
+
+Eagerly updates the model parameters, discarding the updated gradients to save memory.
+`model` stores the parameters to be updated, `state` is the optimization state (eg. from Optimisers.jl) matching your model component, and
+`update!` is the function that updates the parameters (eg. from `Optimisers.jl`), usually called as `update!(state, model, grads)`.
+
+If `f` is a function that takes a single layer, called as `h = f(model.layers[i], h, other_args...)` then we can eagerly update with:
+
+```julia
+h = f(Zygote.eager_update!(state.layers[i], model.layers[i], Optimisers.update!), h, other_args...)
+```
+
+or combine this with gradient checkpointing (for additional memory saving at the cost of increased execution time) with:
+
+```julia
+h = Zygote.checkpointed(f, eager_update!(state.layers[i], model.layers[i], Optimisers.update!), h, other_args...)
+```
+
+If `model.layers[i]` itself is callable, we can use the above by first wrapping it:
+
+```julia
+f(model, xs...) = model(xs...)
+h = f(Zygote.eager_update!(state.layers[i], model.layers[i], Optimisers.update!), h, other_args...)
+```
+
+!!! warning
+    If different layers share trainable parameters, then `eager_update!` will likely give wrong results.
+"""
+function eager_update!(state, model, update!)
+    function update_hook(dmodel)
+        update!(state, model, dmodel)
+        return nothing
+    end
+    return Zygote.hook(update_hook, model)
+end
+
 """
     hessian(f, x)
 
@@ -49,6 +77,8 @@ is higher-dimensional.
 
 This uses forward over reverse, ForwardDiff over Zygote, calling `hessian_dual(f, x)`.
 See [`hessian_reverse`](@ref) for an all-Zygote alternative.
+
+See also [`diaghessian`](@ref) to compute only the diagonal part.
 
 # Examples
 
@@ -103,7 +133,7 @@ This reverse-mode Jacobian needs to evaluate the pullback once for each element 
 Doing so is usually only efficient when `length(y)` is small compared to `length(a)`,
 otherwise forward mode is likely to be better.
 
-See also [`hessian`](@ref), [`hessian_reverse`](@ref).
+See also [`withjacobian`](@ref), [`hessian`](@ref), [`hessian_reverse`](@ref).
 
 # Examples
 
@@ -124,7 +154,7 @@ julia> jacobian((a,d) -> prod(a, dims=d), [1 2; 3 4; 5 6], 2)
 !!! warning
     For arguments of any type except `Number` & `AbstractArray`, the result is `nothing`.
 
-```jldoctest; setup=:(using Zygote)
+```
 julia> jacobian((a,s) -> a.^length(s), [1,2,3], "str")
 ([3 0 0; 0 12 0; 0 0 27], nothing)
 
@@ -132,10 +162,22 @@ julia> jacobian((a,t) -> sum(a .* t[1]) + t[2], [1,2,3], (4,5))
 ([4 4 4], nothing)
 
 julia> gradient((a,t) -> sum(a .* t[1]) + t[2], [1,2,3], (4,5))  # gradient undersands the tuple
-([4, 4, 4], (6, 1))
+([4 4 4], (6, 1))
 ```
 """
-function jacobian(f, args...)
+jacobian(f, args...) = withjacobian(f, args...).grad
+
+"""
+    withjacobian(f, args...)
+
+Returns both the value `f(args...)` and the [`jacobian`](@ref) as a named tuple.
+
+```jldoctest; setup=:(using Zygote)
+julia> withjacobian(cumsum, [1,2,3])
+(val = [1, 3, 6], grad = ([1 0 0; 1 1 0; 1 1 1],))
+```
+"""
+function withjacobian(f, args...)
   y, back = pullback(_jvec∘f, args...)
   out = map(args) do x
     T = promote_type(eltype(x), eltype(y))
@@ -151,7 +193,7 @@ function jacobian(f, args...)
       _gradcopy!(view(dx,k,:), grad)
     end
   end
-  out
+  (val=y, grad=out)
 end
 
 _jvec(x::AbstractArray) = vec(x)
@@ -177,6 +219,10 @@ _gradcopy!(dst::AbstractArray, src::AbstractArray) = copyto!(dst, g isa Number ?
 Like [`gradient`](@ref) with implicit parameters, this method takes a zero-argument function
 and returns an `IdDict`-like object, now containing the Jacobian for each parameter.
 
+!!! warning "Deprecated"
+    Implicit parameters are deprecated and will be removed in a future release.
+    Use the explicit form `jacobian(f, args...)` instead.
+
 # Examples
 ```jldoctest; setup=:(using Zygote)
 julia> xs = [1 2; 3 4]; ys = [5,7,9];
@@ -195,7 +241,9 @@ julia> Jxy[xs]
  2  6  4  8
 ```
 """
-function jacobian(f, pars::Params)
+jacobian(f, pars::Params) = withjacobian(f, pars::Params).grad
+
+function withjacobian(f, pars::Params)
   y, back = pullback(_jvec∘f, pars)
   out = IdDict()
   for p in pars
@@ -211,5 +259,54 @@ function jacobian(f, pars::Params)
       _gradcopy!(view(out[p],k,:), grads[p])
     end
   end
-  Grads(out, pars)
+  (val=y, grad=Grads(out, pars))
 end
+
+"""
+    diaghessian(f, args...) -> Tuple
+
+Diagonal part of the Hessian. Returns a tuple containing, for each argument `x`,
+`h` of the same shape with `h[i] = Hᵢᵢ = ∂²y/∂x[i]∂x[i]`. 
+The original evaluation `y = f(args...)` must give a real number `y`.
+
+For one vector argument `x`, this is equivalent to `(diag(hessian(f,x)),)`.
+Like [`hessian`](@ref) it uses ForwardDiff over Zygote. 
+
+!!! warning
+    For arguments of any type except `Number` & `AbstractArray`, the result is `nothing`.
+
+# Examples
+```jldoctest; setup=:(using Zygote, LinearAlgebra)
+julia> diaghessian(x -> sum(x.^3), [1 2; 3 4])[1]
+2×2 Matrix{$Int}:
+  6  12
+ 18  24
+
+julia> Diagonal(vec(ans)) == hessian(x -> sum(x.^3), [1 2; 3 4])  # full Hessian is diagonal
+true
+
+julia> diaghessian((x,y) -> sum(x .* y .* y'), [1 22; 333 4], [0.5, 0.666])  # two array arguments
+([0.0 0.0; 0.0 0.0], [2.0, 8.0])
+
+julia> diaghessian(atan, 1, 2)  # two scalar arguments
+(-0.16, 0.16)
+
+julia> hessian(xy -> atan(xy[1], xy[2]), [1, 2])  # full Hessian is not diagonal
+2×2 Matrix{Float64}:
+ -0.16  -0.12
+ -0.12   0.16
+```
+"""
+function diaghessian(f, args...)
+  ntuple(length(args)) do n
+    let x = args[n], valn = Val(n)  # let Val improves speed, sometimes
+      if x isa AbstractArray
+        forward_diag(x -> gradient(f, _splice(x, args, valn)...)[n], x)[2]
+      elseif x isa Number
+        ForwardDiff.derivative(x -> gradient(f, _splice(x, args, valn)...)[n], x)
+      end
+    end
+  end
+end
+
+_splice(x, args, ::Val{n}) where {n} = ntuple(i -> i==n ? x : args[i], length(args))

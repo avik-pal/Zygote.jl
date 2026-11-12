@@ -1,7 +1,6 @@
 module Profile
 
-using Requires
-using ..Zygote: Pullback, IdSet, meta, stacklines
+using ..Zygote: Pullback, meta, stacklines
 
 function loc(f)
   # TODO perhaps find most general method
@@ -36,7 +35,7 @@ function mem(x, seen)
   sum(x -> mem(x, seen), fields(x))
 end
 
-mem(x) = mem(x, IdSet())
+mem(x) = mem(x, Base.IdSet())
 
 struct Node
   func::Symbol
@@ -81,17 +80,18 @@ function profile(x)
   Node(Symbol(""), "", -1, cs)
 end
 
-@init @require Atom="c52e3926-4ff0-5f6e-af25-54175e0327b1" begin
-  function tojson(n::Node)
-    name, path = Atom.expandpath(string(n.file))
+# Defined in the ZygoteAtomExt.
+function atom_expandpath end
+function juno end
+
+function tojson(n::Node)
+    name, path = atom_expandpath(string(n.file))
     Dict(:path => path,
          :location => name,
          :func => string(n.func),
          :line => n.line,
          :count => n.size,
          :children => map(tojson, n.children))
-  end
-  juno(n::Node) = Atom.msg("profile", tojson(n))
 end
 
 end

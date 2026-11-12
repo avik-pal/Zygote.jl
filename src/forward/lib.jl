@@ -9,18 +9,28 @@ end
 # TODO figure out why this made a test fail
 zerolike(x::Union{Module,Type}) = nothing
 
-# TODO: `@nograd` and `@linear`
+# Required to not get an UndefRefError on 1.10
+zerolike(x::GlobalRef) = nothing
+
+# TODO: `@non_differentiable` and `@linear`
 
 @tangent zerolike(x) = zerolike(x), _ -> zerolike(x)
 @tangent one(x::Number) = one(x), _ -> zero(x)
 @tangent one(T::Type) = one(T), _ -> zero(T)
 @tangent Core.Typeof(x) = Core.Typeof(x), _ -> nothing
 @tangent typeof(x) = typeof(x), _ -> nothing
+@static if isdefined(Core, :_typeof_captured_variable)  # Core._typeof_captured_variable exists on Julia 1.11+
+  @tangent Core._typeof_captured_variable(x) = Core._typeof_captured_variable(x), _ -> nothing
+end
+@static if isdefined(Core, :has_free_typevars)  # Core.has_free_typevars exists on Julia 1.11+
+  @tangent Core.has_free_typevars(x) = Core.has_free_typevars(x), _ -> false
+end
 @tangent Core.apply_type(args...) = Core.apply_type(args...), (_...) -> nothing
 @tangent fieldtype(args...) = fieldtype(args...), (_...) -> nothing
 @tangent isa(a, b) = isa(a, b), (_, _) -> false
 @tangent repr(x) = repr(x), _ -> nothing
 @tangent println(x...) = println(x...), (_...) -> nothing
+@tangent getglobal(args...) = getglobal(args...), (_...) -> nothing
 @tangent typeassert(x, T) = typeassert(x, T), (ẋ, _) -> ẋ
 @tangent fieldnames(T) = fieldnames(T), _ -> zerolike(fieldnames(T))
 @tangent eltype(x) = eltype(x), ẋ -> zerolike(eltype(ẋ))
@@ -57,10 +67,8 @@ function _pushforward(dargs, ::typeof(Core._apply), f, args...)
   Core._apply(_pushforward, ((df, dargs...), f), args...)
 end
 
-if VERSION >= v"1.4.0-DEV.304"
-  _pushforward(dargs, ::typeof(Core._apply_iterate), ::typeof(iterate), f, args...) =
-    _pushforward((first(args), tail(tail(dargs))...), Core._apply, f, args...)
-end
+_pushforward(dargs, ::typeof(Core._apply_iterate), ::typeof(iterate), f, args...) =
+  _pushforward((first(args), tail(tail(dargs))...), Core._apply, f, args...)
 
 using ..Zygote: literal_getproperty, literal_getfield, literal_getindex
 
